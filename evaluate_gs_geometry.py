@@ -647,7 +647,7 @@ def evaluate_scene(dataset, pipeline, scene_name, satellite_data_path, gt_data_p
             checkpoint_path = os.path.join(dataset.model_path, f"chkpnt{iteration}.pth")
             print(f"Loading model from checkpoint {checkpoint_path}")
             if os.path.exists(checkpoint_path):
-                (model_params, first_iter) = torch.load(checkpoint_path)
+                (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
                 gaussians.load_from_checkpoints(model_params)
             else:
                 print(f"Checkpoint not found: {checkpoint_path}")

@@ -24,7 +24,7 @@ if __name__ == "__main__":
     if args.load_from_checkpoints:
         checkpoint_path = os.path.join(dataset.model_path, f"chkpnt{args.iteration}.pth")
         print(f"Loading model from checkpoint {checkpoint_path}")
-        (model_params, first_iter) = torch.load(checkpoint_path)
+        (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
         gaussians.load_from_checkpoints(model_params)
     gaussians.load_ply(os.path.join(dataset.model_path, "point_cloud", f"iteration_{args.iteration}", "point_cloud.ply"))
     gaussians.save_fused_ply(args.output_ply, args.load_from_checkpoints)

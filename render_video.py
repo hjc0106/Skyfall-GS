@@ -193,7 +193,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if load_from_checkpoints:
             checkpoint_path = os.path.join(dataset.model_path, f"chkpnt{iteration}.pth")
             print(f"Loading model from checkpoint {checkpoint_path}")
-            (model_params, first_iter) = torch.load(checkpoint_path)
+            (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
             gaussians.load_from_checkpoints(model_params)
         
         print(gaussians._xyz.shape)

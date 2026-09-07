@@ -31,6 +31,8 @@ from arguments import ModelParams, PipelineParams, OptimizationParams, IDUParams
 from utils.camera_utils import gen_idu_orbit_camera, cameraList_from_camInfos
 from scene.dataset_readers import CameraInfo
 
+import json
+
 from PIL import Image
 from submodules.MoGe.idu_depth import MoGeIDU
 
@@ -96,7 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         print("Restoring model from checkpoint")
         # original implementation
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
         # set correct xyz lr scheduler
         opt.position_lr_max_steps = opt.iterations
@@ -347,6 +349,85 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+def idu_episode_dirname(episode_idx: int, elevation, radius) -> str:
+    if isinstance(elevation, list) or isinstance(radius, list):
+        return f"episode_{episode_idx:02d}"
+    return f"episode_{episode_idx:02d}_e{elevation:g}_r{radius:g}"
+
+
+def write_idu_compare_html(episode_dir: str, n_images: int, episode_idx: int, elevation, radius) -> None:
+    rows = []
+    for idx in range(n_images):
+        name = f"{idx:05d}.png"
+        rows.append(
+            "<tr>"
+            f"<td>{idx:05d}</td>"
+            f'<td><img src="render/{name}" /></td>'
+            f'<td><img src="render_refine/{name}" /></td>'
+            f'<td><img src="render_after_train/{name}" /></td>'
+            "</tr>"
+        )
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<title>IDU episode {episode_idx:02d}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin: 16px; font-family: ui-sans-serif, system-ui, sans-serif; background: #111; color: #eee; }}
+  img {{ width: 280px; height: auto; background: #000; }}
+  table {{ border-collapse: collapse; }}
+  td, th {{ padding: 6px; vertical-align: top; }}
+</style></head><body>
+<h2>Episode {episode_idx:02d} · e={elevation} · r={radius}</h2>
+<p>left: 3DGS render · middle: FlowEdit · right: after this episode's 3DGS training (filled later)</p>
+<table>
+<tr><th>id</th><th>render</th><th>render_refine</th><th>render_after_train</th></tr>
+{''.join(rows)}
+</table></body></html>
+"""
+    with open(os.path.join(episode_dir, "compare.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def update_idu_root_index(model_path: str, record: dict) -> None:
+    index_path = os.path.join(model_path, "idu", "manifest.json")
+    payload = {"episodes": []}
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    episodes = [e for e in payload.get("episodes", []) if e.get("episode_idx") != record["episode_idx"]]
+    episodes.append(record)
+    episodes.sort(key=lambda e: e["episode_idx"])
+    payload["episodes"] = episodes
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    links = [
+        f'<li><a href="{e["dirname"]}/compare.html">episode {e["episode_idx"]:02d}</a> '
+        f'(e={e["elevation"]}, r={e["radius"]}, n={e["n_images"]})</li>'
+        for e in episodes
+    ]
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8' /><title>IDU episodes</title></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        "<h2>Skyfall-GS Stage 2 IDU</h2><ul>"
+        + "".join(links)
+        + "</ul></body></html>"
+    )
+    with open(os.path.join(model_path, "idu", "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+@torch.no_grad()
+def save_idu_after_train_renders(views, gaussians, pipeline, background, kernel_size, save_dir: str) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    for idx, view in enumerate(tqdm(views, desc="IDU after-train render")):
+        rendering = render(view, gaussians, pipeline, background, kernel_size=kernel_size, testing=True)["render"]
+        img = rendering.detach().cpu().permute(1, 2, 0).numpy()
+        Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)).save(
+            os.path.join(save_dir, f"{idx:05d}.png")
+        )
+
+
 @torch.no_grad()
 def render_idu_set(views, gaussians, pipeline, background, kernel_size, idu_random_ap=False):
     imgs = []
@@ -368,12 +449,14 @@ def generate_idu_training_set(
     use_dreamscene: bool=False, use_sd21: bool=True,
     difix3d_guidance: float=0.0, difix3d_timesteps: list=None, difix3d_use_reference: bool=False,
     difix3d_prompt: str="remove degradation",
-    refine=True, idu_no_curriculum=False, idu_random_ap=False
+    refine=True, idu_no_curriculum=False, idu_random_ap=False,
+    episode_idx: int = 0,
+    flux_model_path: str | None = None,
 ):
 
     gaussians = GaussianModel(dataset.sh_degree, dataset.appearance_enabled, dataset.appearance_n_fourier_freqs, dataset.appearance_embedding_dim)
     print(f"Loading model from checkpoint {checkpoint_path}")
-    (model_params, first_iter) = torch.load(checkpoint_path)
+    (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
     gaussians.load_from_checkpoints(model_params)
     base_dir = os.path.dirname(checkpoint_path)
     print(base_dir)
@@ -432,25 +515,25 @@ def generate_idu_training_set(
     cam_lists = cameraList_from_camInfos(idu_cam_infos, 1, dataset, is_pseudo_cam=idu_random_ap)
     imgs = render_idu_set(cam_lists, gaussians, pipeline, background, kernel_size, idu_random_ap)
 
-    # render folder, used to store the unprocessed images
-    frames_path = os.path.join(dataset.model_path, "idu", f"e{elevation}_r{radius}", "render")
+    episode_name = idu_episode_dirname(episode_idx, elevation, radius)
+    episode_root = os.path.join(dataset.model_path, "idu", episode_name)
+    frames_path = os.path.join(episode_root, "render")
     os.makedirs(frames_path, exist_ok=True)
     for idx, img in enumerate(imgs):
         img_path = os.path.join(frames_path, '{0:05d}'.format(idx) + ".png")
         Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)).save(img_path)
     
     # Load 
-    refine_path = os.path.join(dataset.model_path, "idu", f"e{elevation}_r{radius}", "render_refine")
+    refine_path = os.path.join(episode_root, "render_refine")
     refine_pipe = None
     
     final_imgs = []
     if refine:
         if use_flow_edit:
-            refine_pipe = FlowEditRefineIDU(
-                save_path = refine_path,
-                device="cuda:0",
-                model_type=model_type
-            )
+            fe_kwargs = dict(save_path=refine_path, device="cuda:0", model_type=model_type)
+            if flux_model_path:
+                fe_kwargs["model_path"] = flux_model_path
+            refine_pipe = FlowEditRefineIDU(**fe_kwargs)
             final_imgs = refine_pipe.run(
                 imgs,
                 n_min=flow_edit_n_min,
@@ -492,7 +575,7 @@ def generate_idu_training_set(
             final_imgs.append(Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)))
 
 
-    depth_path = os.path.join(dataset.model_path, "idu", f"e{elevation}_r{radius}", "render_depth")
+    depth_path = os.path.join(episode_root, "render_depth")
     os.makedirs(depth_path, exist_ok=True)
     moge = MoGeIDU(
         depth_path,
@@ -521,6 +604,38 @@ def generate_idu_training_set(
     del moge
     del gaussians
     torch.cuda.empty_cache()
+
+    meta = {
+        "episode_idx": episode_idx,
+        "dirname": episode_name,
+        "elevation": elevation if not isinstance(elevation, list) else list(elevation),
+        "radius": radius if not isinstance(radius, list) else list(radius),
+        "n_images": len(final_imgs),
+        "render_dir": frames_path,
+        "refine_dir": refine_path,
+        "depth_dir": depth_path,
+        "checkpoint_used": checkpoint_path,
+        "cameras": [
+            {
+                "index": idx,
+                "uid": int(cam.uid),
+                "image_name": cam.image_name,
+            }
+            for idx, cam in enumerate(idu_cam_infos)
+        ],
+    }
+    os.makedirs(episode_root, exist_ok=True)
+    with open(os.path.join(episode_root, "episode_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    write_idu_compare_html(episode_root, len(final_imgs), episode_idx, elevation, radius)
+    update_idu_root_index(dataset.model_path, {
+        "episode_idx": episode_idx,
+        "dirname": episode_name,
+        "elevation": meta["elevation"],
+        "radius": meta["radius"],
+        "n_images": len(final_imgs),
+    })
+    print(f"Saved IDU episode artifacts to {episode_root}")
 
     return final_cam_lists
 
@@ -580,7 +695,8 @@ def training_idu_episode(
         dataset, opt, pipe, 
         checkpoint_path,
         targets, elevation, radius, fov,
-        idu_num_cams, idu_num_samples_per_view
+        idu_num_cams, idu_num_samples_per_view,
+        episode_idx: int = 0,
     ):
     # NOTE: generate pose -> render frame -> refined using DiffusionSat -> use MoGe to predict monocular depth
     if opt.use_lpips_loss:
@@ -616,7 +732,9 @@ def training_idu_episode(
         difix3d_guidance=opt.idu_difix3d_guidance, difix3d_timesteps=opt.idu_difix3d_timesteps, 
         difix3d_use_reference=opt.idu_difix3d_use_reference, difix3d_prompt=opt.idu_difix3d_prompt,
         use_dreamscene=opt.idu_use_dreamscene, use_sd21=opt.idu_use_sd21,
-        refine=opt.idu_refine, idu_no_curriculum=opt.idu_no_curriculum, idu_random_ap=opt.idu_random_ap
+        refine=opt.idu_refine, idu_no_curriculum=opt.idu_no_curriculum, idu_random_ap=opt.idu_random_ap,
+        episode_idx=episode_idx,
+        flux_model_path=getattr(opt, "flux_model_path", "") or None,
     )
 
     # load Gaussians and scene
@@ -639,7 +757,7 @@ def training_idu_episode(
     if checkpoint_path:
         print(f"Restoring model from checkpoint {checkpoint_path}")
         # original implementation
-        (model_params, first_iter) = torch.load(checkpoint_path)
+        (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
         gaussians.restore(model_params, opt, iterative_datasets_update=True)
         print("Restored model from checkpoint at iteration {}".format(first_iter))
         opt.iterations = first_iter + opt.idu_episode_iterations  # TODO: make this a parameter
@@ -912,6 +1030,17 @@ def training_idu_episode(
                 torch.save((gaussians.capture(), iteration), checkpoint_path)
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+    episode_name = idu_episode_dirname(episode_idx, elevation, radius)
+    after_dir = os.path.join(dataset.model_path, "idu", episode_name, "render_after_train")
+    save_idu_after_train_renders(
+        scene.getTrainIDUCameras(),
+        gaussians,
+        pipe,
+        background,
+        dataset.kernel_size,
+        after_dir,
+    )
                 
     return checkpoint_path
 
@@ -942,27 +1071,29 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
     assert len(targets) == opt.idu_grid_size * opt.idu_grid_size
     if not opt.idu_no_curriculum:
         
-        for radius, elevation in zip(opt.idu_radius_list, opt.idu_elevation_list):
-            print(f"Training IDU episode with elevation {elevation} and radius {radius}")
+        for episode_idx, (radius, elevation) in enumerate(zip(opt.idu_radius_list, opt.idu_elevation_list)):
+            print(f"Training IDU episode {episode_idx} with elevation {elevation} and radius {radius}")
             print(f"# of IDU targets: {len(targets)}")
             start_checkpoint_path = training_idu_episode(
                 dataset, opt, pipe, 
                 checkpoint_path=start_checkpoint_path,
                 targets=targets, elevation=elevation, radius=radius, fov=opt.idu_fov,
                 idu_num_cams=opt.idu_num_cams,
-                idu_num_samples_per_view=opt.idu_num_samples_per_view
+                idu_num_samples_per_view=opt.idu_num_samples_per_view,
+                episode_idx=episode_idx,
             )
     else:
         print("===== Disable IDU curriculum learning =====")
         assert opt.idu_episode_iterations == 10000, "IDU episode iterations should be 10000"
         assert opt.idu_densify_until_iter == 9000, "IDU episode iterations should be 9000"
-        for _ in range(5):
+        for episode_idx in range(5):
             start_checkpoint_path = training_idu_episode(
                 dataset, opt, pipe, 
                 checkpoint_path=start_checkpoint_path,
                 targets=targets, elevation=opt.idu_elevation_list, radius=opt.idu_radius_list, fov=opt.idu_fov,
                 idu_num_cams=opt.idu_num_cams,
-                idu_num_samples_per_view=opt.idu_num_samples_per_view
+                idu_num_samples_per_view=opt.idu_num_samples_per_view,
+                episode_idx=episode_idx,
             )
         
 

@@ -272,6 +272,7 @@ class OptimizationParams(ParamGroup):
         self.idu_flow_edit_n_max_end: int = -1  # -1 means not using sampling
         self.idu_flow_edit_n_avg: int = 1
         self.idu_model_type: str = "FLUX"
+        self.flux_model_path: str = ""
     
     def _init_difix3d_params(self):
         """Initialize Difix3D parameters."""
