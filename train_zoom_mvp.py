@@ -13,7 +13,7 @@ import argparse
 import os
 import random
 from argparse import Namespace
-from typing import List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -34,14 +34,29 @@ from utils.zoom_camera import (
     save_roi_overlay,
 )
 from utils.zoom_mvp_utils import (
+    PARKING_CROP_BOX,
+    DetailLayerSnapshot,
     GeometrySnapshot,
+    append_detail_gaussians,
+    apply_detail_grad_mask,
     assert_post_train_checks,
+    clamp_detail_scale,
+    compensate_detail_opacity_for_filter,
     compute_post_train_metrics,
+    configure_optimizer_for_detail,
+    crop_chw,
+    detail_layer_stats,
+    diagnose_projection_and_filter,
     embedding_for_train_camera,
+    freeze_appearance_for_zoom,
     freeze_geometry_for_zoom,
+    parse_crop_box,
+    save_residual_image,
     save_tensor_image,
+    seed_detail_gaussians,
     select_appearance_embedding,
     write_json,
+    write_level_review_html,
 )
 
 try:
@@ -71,6 +86,25 @@ def pick_base_camera(scene: Scene, view_index: int, use_test: bool):
     return cameras[view_index], not use_test
 
 
+def render_package(
+    camera,
+    gaussians: GaussianModel,
+    pipe,
+    background: torch.Tensor,
+    kernel_size: float,
+    appearance_embedding: torch.Tensor | None,
+) -> Dict:
+    return render(
+        camera,
+        gaussians,
+        pipe,
+        background,
+        kernel_size=kernel_size,
+        testing=False,
+        appearance_embedding=appearance_embedding,
+    )
+
+
 @torch.no_grad()
 def render_view(
     camera,
@@ -80,14 +114,8 @@ def render_view(
     kernel_size: float,
     appearance_embedding: torch.Tensor | None,
 ) -> torch.Tensor:
-    return render(
-        camera,
-        gaussians,
-        pipe,
-        background,
-        kernel_size=kernel_size,
-        testing=False,
-        appearance_embedding=appearance_embedding,
+    return render_package(
+        camera, gaussians, pipe, background, kernel_size, appearance_embedding
     )["render"]
 
 
@@ -136,9 +164,13 @@ def train_appearance_only(
     num_steps: int,
     mix_ratio: float,
     lambda_dssim: float,
+    n_coarse: Optional[int] = None,
+    freeze_detail_scale: bool = False,
+    clamp_screen_px: Optional[Tuple[float, float]] = None,
 ) -> None:
     train_stack = list(train_cameras)
-    progress = tqdm(range(num_steps), desc="appearance-only")
+    desc = "detail-layer" if n_coarse is not None else "appearance-only"
+    progress = tqdm(range(num_steps), desc=desc)
     for step in progress:
         if random.random() >= mix_ratio:
             viewpoint = zoom_train_cam
@@ -157,7 +189,17 @@ def train_appearance_only(
             embedding,
             lambda_dssim,
         )
+        if n_coarse is not None:
+            apply_detail_grad_mask(gaussians, n_coarse, freeze_scale=freeze_detail_scale)
         gaussians.optimizer.step()
+        if n_coarse is not None and clamp_screen_px is not None:
+            clamp_detail_scale(
+                gaussians,
+                n_coarse,
+                zoom_train_cam,
+                min_px=clamp_screen_px[0],
+                max_px=clamp_screen_px[1],
+            )
         if step % 20 == 0:
             progress.set_postfix(loss=f"{loss.item():.5f}")
 
@@ -271,13 +313,49 @@ def main() -> None:
         help="'unsharp' is a FLUX-free dry run for validating the pipeline.",
     )
     parser.add_argument(
-        "--flux_model_path",
+        "--refined_image",
         type=str,
         default=None,
-        help="Local diffusers checkpoint dir; falls back to the HuggingFace hub id.",
+        help="Reuse an existing refined PNG and skip FlowEdit/unsharp.",
     )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--crop_box",
+        type=str,
+        default=",".join(str(v) for v in PARKING_CROP_BOX),
+        help="x0,y0,x1,y1 crop for parking-stall metrics. Default is the JAX_068 4x parking crop. 'none' disables.",
+    )
+    parser.add_argument(
+        "--add_detail_gaussians",
+        action="store_true",
+        help="Freeze existing Gaussians and seed a fixed-count surface detail layer from high-residual pixels.",
+    )
+    parser.add_argument("--detail_count", type=int, default=20000, help="Target number of new Gaussians (about 10k-30k).")
+    parser.add_argument("--detail_init_opacity", type=float, default=0.25)
+    parser.add_argument("--detail_min_alpha", type=float, default=0.9)
+    parser.add_argument("--detail_min_depth", type=float, default=0.2)
+    parser.add_argument(
+        "--detail_front_offset_px",
+        type=float,
+        default=0.25,
+        help="Requested pull toward camera in world-pixel units. Enlarged to a few float32 ULPs if needed.",
+    )
+    parser.add_argument(
+        "--detail_max_depth_jump_px",
+        type=float,
+        default=2.0,
+        help="Reject seed pixels whose 3x3 expected-depth jump exceeds this many world pixels.",
+    )
+    parser.add_argument(
+        "--detail_scale_mode",
+        type=str,
+        default="train",
+        choices=["train", "freeze", "clamp"],
+        help="train: previous unconstrained scale. freeze: keep 1px init. clamp: keep scale in [min,max] px.",
+    )
+    parser.add_argument("--detail_min_screen_px", type=float, default=1.0)
+    parser.add_argument("--detail_max_screen_px", type=float, default=3.0)
 
     args = parser.parse_args()
     safe_state(args.quiet)
@@ -288,6 +366,11 @@ def main() -> None:
     zoom_factors = parse_zoom_factors(args.zoom_factors)
     roi = NormalizedROI(args.roi_center_x, args.roi_center_y, args.roi_width, args.roi_height)
     roi.validate_in_bounds()
+    crop_box = parse_crop_box(args.crop_box)
+    if args.add_detail_gaussians and not (10000 <= args.detail_count <= 30000):
+        print(
+            f"Warning: detail_count={args.detail_count} is outside the planned 10k-30k range; continuing anyway."
+        )
 
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -338,7 +421,10 @@ def main() -> None:
         num_train_cameras=len(train_cameras),
         from_scratch=False,
     )
-    freeze_geometry_for_zoom(gaussians)
+    if args.add_detail_gaussians:
+        freeze_appearance_for_zoom(gaussians)
+    else:
+        freeze_geometry_for_zoom(gaussians)
     geometry_snapshot = GeometrySnapshot.from_gaussians(gaussians)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -360,6 +446,12 @@ def main() -> None:
         "zoom_factors": zoom_factors,
         "steps_per_level": args.steps_per_level,
         "mix_ratio": args.mix_ratio,
+        "refined_image": os.path.abspath(args.refined_image) if args.refined_image else None,
+        "crop_box": list(crop_box) if crop_box is not None else None,
+        "add_detail_gaussians": bool(args.add_detail_gaussians),
+        "detail_count": args.detail_count if args.add_detail_gaussians else 0,
+        "detail_scale_mode": args.detail_scale_mode if args.add_detail_gaussians else None,
+        "detail_min_alpha": args.detail_min_alpha if args.add_detail_gaussians else None,
         "levels": [],
     }
 
@@ -407,12 +499,25 @@ def main() -> None:
 
         gaussians.compute_3D_filter(cameras=list(train_cameras) + [zoom_cam])
 
-        render_before = render_view(
+        before_pkg = render_package(
             zoom_cam, gaussians, pipe, background, dataset.kernel_size, appearance_embedding
         )
+        render_before = before_pkg["render"]
         save_tensor_image(render_before, os.path.join(level_dir, "render_before.png"))
+        if crop_box is not None:
+            _, img_h, img_w = render_before.shape
+            x0, y0, x1, y1 = crop_box
+            if x0 < 0 or y0 < 0 or x1 > img_w or y1 > img_h:
+                print(f"Warning: crop_box {list(crop_box)} exceeds image {img_w}x{img_h}; disabling crop metrics.")
+                crop_box = None
 
-        if args.refine_mode == "unsharp":
+        if args.refined_image:
+            refined_path = os.path.abspath(args.refined_image)
+            if not os.path.isfile(refined_path):
+                raise FileNotFoundError(f"refined_image not found: {refined_path}")
+            refined_pil = Image.open(refined_path).convert("RGB")
+            print(f"Reusing refined image: {refined_path}")
+        elif args.refine_mode == "unsharp":
             refined_pil = run_unsharp(render_before, save_dir=os.path.join(level_dir, "unsharp"))
         else:
             refined_pil = run_flowedit(
@@ -427,6 +532,106 @@ def main() -> None:
                 model_path=args.flux_model_path,
             )
         refined_pil.save(os.path.join(level_dir, "refined.png"))
+        refined_tensor = refined_pil_to_tensor(
+            refined_pil, zoom_cam.image_width, zoom_cam.image_height, render_before.device
+        )
+
+        filter_diag = diagnose_projection_and_filter(
+            gaussians,
+            zoom_cam,
+            radii=before_pkg["radii"],
+            label="coarse_visible",
+        )
+        write_json(os.path.join(level_dir, "filter_diag.json"), filter_diag)
+        print(
+            f"Filter diag: visible={filter_diag['n_visible']}, "
+            f"screen_px median={filter_diag['screen_px_with_filter']['p50']:.2f}, "
+            f"filter_screen_px median={filter_diag['filter_screen_px']['p50']:.2f}, "
+            f"1px_eff_px median={filter_diag['one_px_effective_screen_px']['p50']:.2f}, "
+            f"survives={filter_diag['new_1px_survives_filter']}"
+        )
+
+        n_coarse = None
+        detail_snapshot = None
+        detail_before_stats = None
+        freeze_detail_scale = args.add_detail_gaussians and args.detail_scale_mode == "freeze"
+        clamp_screen_px = (
+            (args.detail_min_screen_px, args.detail_max_screen_px)
+            if args.add_detail_gaussians and args.detail_scale_mode == "clamp"
+            else None
+        )
+        if args.add_detail_gaussians:
+            seeded = seed_detail_gaussians(
+                gaussians,
+                zoom_cam,
+                render_before,
+                refined_tensor,
+                before_pkg["render_depth"],
+                before_pkg["render_alpha"],
+                n_target=args.detail_count,
+                min_alpha=args.detail_min_alpha,
+                min_depth=args.detail_min_depth,
+                init_opacity=args.detail_init_opacity,
+                front_offset_px=args.detail_front_offset_px,
+                max_depth_jump_px=args.detail_max_depth_jump_px,
+            )
+            save_tensor_image(seeded["seed_map"], os.path.join(level_dir, "detail_seed_map.png"))
+            n_coarse = append_detail_gaussians(gaussians, seeded)
+            gaussians.compute_3D_filter(cameras=list(train_cameras) + [zoom_cam])
+            opacity_comp = compensate_detail_opacity_for_filter(
+                gaussians, n_coarse, target_opacity=args.detail_init_opacity
+            )
+            configure_optimizer_for_detail(gaussians, freeze_scale=freeze_detail_scale)
+            detail_snapshot = DetailLayerSnapshot.from_gaussians(
+                gaussians, n_coarse, freeze_detail_scale=freeze_detail_scale
+            )
+            seed_pkg = render_package(
+                zoom_cam, gaussians, pipe, background, dataset.kernel_size, appearance_embedding
+            )
+            save_tensor_image(seed_pkg["render"], os.path.join(level_dir, "render_after_seed.png"))
+            detail_mask = torch.zeros((gaussians._xyz.shape[0],), device=gaussians._xyz.device, dtype=torch.bool)
+            detail_mask[n_coarse:] = True
+            detail_filter_diag = diagnose_projection_and_filter(
+                gaussians,
+                zoom_cam,
+                radii=seed_pkg["radii"],
+                subset=detail_mask,
+                label="detail_after_seed",
+            )
+            detail_before_stats = {
+                "n_seeded": int(gaussians._xyz.shape[0] - n_coarse),
+                "n_candidates_before_dedup": seeded["n_candidates_before_dedup"],
+                "n_valid_seed_pixels": seeded["n_valid_seed_pixels"],
+                "voxel_size": seeded["voxel_size"],
+                "mean_residual": seeded["mean_residual"],
+                "mean_depth": seeded["mean_depth"],
+                "mean_accum_depth": seeded["mean_accum_depth"],
+                "mean_pixel_world": seeded["mean_pixel_world"],
+                "mean_alpha_proxy": seeded["mean_alpha_proxy"],
+                "mean_float32_ulp": seeded["mean_float32_ulp"],
+                "mean_requested_offset": seeded["mean_requested_offset"],
+                "mean_applied_offset": seeded["mean_applied_offset"],
+                "frac_offset_bumped_for_ulp": seeded["frac_offset_bumped_for_ulp"],
+                "seed_geometry": seeded["seed_geometry"],
+                "opacity_compensation": opacity_comp,
+                "filter_diag": detail_filter_diag,
+                "layer_stats": detail_layer_stats(gaussians, zoom_cam, detail_snapshot, radii=seed_pkg["radii"]),
+            }
+            write_json(os.path.join(level_dir, "detail_before.json"), detail_before_stats)
+            write_json(os.path.join(level_dir, "seed_geometry.json"), seeded["seed_geometry"])
+            print(
+                f"Seeded {detail_before_stats['n_seeded']} detail Gaussians "
+                f"(voxel={seeded['voxel_size']:.4f}, "
+                f"filter_coef_median={opacity_comp['filter_opacity_coef_median']:.3f}, "
+                f"1px_survives={detail_filter_diag['new_1px_survives_filter']}, "
+                f"reproj_p50={seeded['seed_geometry']['pixel_err_p50']:.3f}px, "
+                f"front_offset_actual={seeded['seed_geometry']['actual_front_offset_p50']:.4g})"
+            )
+            if not detail_filter_diag["new_1px_survives_filter"]:
+                print(
+                    "Warning: filter_3D is large enough that new ~1px Gaussians are immediately smoothed. "
+                    "Inspect filter_diag.json before interpreting a blurry result as a capacity failure."
+                )
 
         zoom_train_cam = camera_from_pil_image(
             zoom_cam,
@@ -446,18 +651,32 @@ def main() -> None:
             num_steps=args.steps_per_level,
             mix_ratio=args.mix_ratio,
             lambda_dssim=opt.lambda_dssim,
+            n_coarse=n_coarse,
+            freeze_detail_scale=freeze_detail_scale,
+            clamp_screen_px=clamp_screen_px,
         )
         global_step += args.steps_per_level
 
-        render_after = render_view(
+        after_pkg = render_package(
             zoom_cam, gaussians, pipe, background, dataset.kernel_size, appearance_embedding
         )
+        render_after = after_pkg["render"]
         save_tensor_image(render_after, os.path.join(level_dir, "render_after.png"))
+        save_residual_image(refined_tensor, render_before, os.path.join(level_dir, "residual_before.png"))
+        save_residual_image(refined_tensor, render_after, os.path.join(level_dir, "residual_after.png"))
 
-        refined_tensor = refined_pil_to_tensor(
-            refined_pil, zoom_cam.image_width, zoom_cam.image_height, render_after.device
+        metrics = compute_post_train_metrics(
+            render_before, render_after, refined_tensor, crop_box=crop_box
         )
-        metrics = compute_post_train_metrics(render_before, render_after, refined_tensor)
+        if crop_box is not None:
+            save_tensor_image(crop_chw(refined_tensor, crop_box), os.path.join(level_dir, "crop_refined.png"))
+            save_tensor_image(crop_chw(render_before, crop_box), os.path.join(level_dir, "crop_before.png"))
+            save_tensor_image(crop_chw(render_after, crop_box), os.path.join(level_dir, "crop_after.png"))
+            save_residual_image(
+                crop_chw(refined_tensor, crop_box),
+                crop_chw(render_after, crop_box),
+                os.path.join(level_dir, "crop_residual_after.png"),
+            )
 
         ckpt_path = os.path.join(level_dir, f"chkpnt_zoom{zoom_factor:g}.pth")
         torch.save((gaussians.capture(), global_step), ckpt_path)
@@ -475,7 +694,23 @@ def main() -> None:
             neighbor_l1 = float(
                 torch.abs(neighbor_render - neighbor.original_image.cuda()).mean().item()
             )
-            neighbor_metrics[neighbor.image_name] = {"l1_to_gt": neighbor_l1}
+            neighbor_metrics[neighbor.image_name] = {
+                "l1_to_gt": neighbor_l1,
+                "l1_delta_vs_baseline": neighbor_l1 - neighbor_baseline[neighbor.image_name],
+            }
+
+        detail_after_stats = None
+        if detail_snapshot is not None:
+            detail_after_stats = detail_layer_stats(
+                gaussians, zoom_cam, detail_snapshot, radii=after_pkg["radii"]
+            )
+            write_json(os.path.join(level_dir, "detail_after.json"), detail_after_stats)
+            print(
+                f"Detail after: opacity_p50={detail_after_stats['opacity']['p50']:.4f}, "
+                f"frac_opacity<0.01={detail_after_stats['frac_opacity_lt_0.01']:.3f}, "
+                f"scale_inflation_p50={detail_after_stats['scale_inflation']['p50']:.2f}, "
+                f"frac_scale>4x={detail_after_stats['frac_scale_gt_4x_init']:.3f}"
+            )
 
         level_record = {
             "zoom_factor": zoom_factor,
@@ -483,13 +718,56 @@ def main() -> None:
             "metrics": metrics,
             "neighbor_cameras": nearest_names,
             "neighbor_metrics": neighbor_metrics,
+            "filter_diag": {
+                "n_visible": filter_diag["n_visible"],
+                "screen_px_p50": filter_diag["screen_px_with_filter"]["p50"],
+                "filter_screen_px_p50": filter_diag["filter_screen_px"]["p50"],
+                "one_px_effective_screen_px_p50": filter_diag["one_px_effective_screen_px"]["p50"],
+                "new_1px_survives_filter": filter_diag["new_1px_survives_filter"],
+            },
+            "detail_before": detail_before_stats,
+            "detail_after": detail_after_stats,
         }
         manifest["levels"].append(level_record)
         write_json(os.path.join(output_dir, "manifest.json"), manifest)
+
+        image_entries = [
+            ("refined", "refined.png"),
+            ("render_before", "render_before.png"),
+            ("render_after", "render_after.png"),
+            ("residual_before x6", "residual_before.png"),
+            ("residual_after x6", "residual_after.png"),
+        ]
+        if args.add_detail_gaussians:
+            image_entries.insert(2, ("render_after_seed", "render_after_seed.png"))
+            image_entries.append(("detail seed map", "detail_seed_map.png"))
+        if crop_box is not None:
+            image_entries.extend(
+                [
+                    ("crop refined", "crop_refined.png"),
+                    ("crop before", "crop_before.png"),
+                    ("crop after", "crop_after.png"),
+                    ("crop residual after x6", "crop_residual_after.png"),
+                ]
+            )
+        write_level_review_html(
+            os.path.join(level_dir, "index.html"),
+            title=f"{base_cam.image_name} {zoom_factor:g}x"
+            + (" + detail layer" if args.add_detail_gaussians else ""),
+            metrics=metrics,
+            neighbor_metrics=neighbor_metrics,
+            neighbor_baseline=neighbor_baseline,
+            filter_diag=filter_diag,
+            detail_before=detail_before_stats,
+            detail_after=detail_after_stats,
+            image_entries=image_entries,
+        )
         print(f"Level {zoom_factor:g}x done. metrics={metrics}")
 
         # Assert only after every artifact is durable, so a failure is still diagnosable.
-        assert_post_train_checks(geometry_snapshot, gaussians, metrics)
+        assert_post_train_checks(
+            geometry_snapshot, gaussians, metrics, detail_snapshot=detail_snapshot
+        )
 
     final_ckpt = os.path.join(output_dir, "chkpnt_final.pth")
     torch.save((gaussians.capture(), global_step), final_ckpt)

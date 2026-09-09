@@ -29,6 +29,7 @@
 - [Dataset](#dataset)
 - [Running on Custom Datasets](#running-on-custom-datasets)
 - [Training](#training)
+  - [Independent zoom generation (`dev-gen`)](#independent-zoom-generation-dev-gen)
   - [Stage 1: Reconstruction](#stage-1-reconstruction)
   - [Stage 2: Synthesis with Iterative Dataset Update (IDU)](#stage-2-synthesis-with-iterative-dataset-update-idu)
 - [Automated Training Scripts](#automated-training-scripts)
@@ -200,6 +201,51 @@ python train.py \
     --idu_densify_until_iter 9000 \
     --idu_train_ratio 0.75
 ```
+
+### Independent zoom generation (`dev-gen`)
+
+`train_zoom_gen.py` is an independent progressive zoom entry point. It keeps
+`train_zoom_mvp.py` as the baseline and delegates image generation to the
+backends in `refinement/`.
+
+```bash
+python train_zoom_gen.py \
+    --start_checkpoint ./outputs/JAX/JAX_068/chkpnt30000.pth \
+    --output_dir ./outputs/JAX_zoom_gen/JAX_068 \
+    --view_index 0 \
+    --roi_center_x 0.5 --roi_center_y 0.5 \
+    --roi_width 0.1 --roi_height 0.1 \
+    --zoom_factors 2,4,8 \
+    --sr_scale 1 \
+    --supervision_mode original \
+    --refine_backend unsharp
+```
+
+`zoom_factors` controls the focal-length/camera course. `sr_scale` controls
+the generated image pixel multiplier and is independent of the camera zoom.
+Use `--supervision_mode highres` to retain SR pixels and update the supervision
+camera's image size while keeping its FoV and normalized principal point.
+
+The comparable generation modes are:
+
+- `flowedit`: existing FlowEdit baseline.
+- `reuse`: use `--refined_image` or a prior run directory.
+- `sr_fixed`: text-conditioned SR with command-line prompts.
+- `sr_vlm`: text-conditioned SR with live local Qwen3-VL via
+  `--vlm_model_path`, or a recorded structured result via `--prompt_json`.
+- `unsharp`: deterministic offline smoke-test backend.
+
+Geometry diagnostics are enabled by default (`--geometry_neighbor_count 2`). Each
+level estimates a world-space target from zoom depth/alpha, projects it into
+neighbor cameras, renders neighbor RGB/depth/alpha, and writes
+`geometry.json`, spatial ROI overlays, reprojection images, validity masks, and
+RGB overlays. Use `--skip_geometry` to reproduce the single-view path exactly.
+Add `--multiview_refine` only when the geometry-aligned neighbor RGB should be
+fused before the selected backend; this is RGB fusion, not feature-level
+propagation.
+
+Each completed level stores `wide.png`, `render_before.png`, `prompt.json`,
+`refined.png`, `render_after.png`, `metrics.json`, and a level checkpoint under `zoom_<factor>x/`.
 
 ## Automated Training Scripts
 
@@ -377,3 +423,34 @@ If you find this work useful, please consider citing:
 ## License
 
 This project is licensed under the terms of the [Apache 2 License](LICENSE).
+
+### Local Qwen3-VL prompts for zoom generation
+
+`train_zoom_gen.py` can generate structured prompts from the wide and zoom
+renderings using local Qwen3-VL-4B-Instruct weights. Add these arguments to your
+existing zoom-generation command (including its checkpoint, ROI and SR settings):
+
+```bash
+--refine_backend sr_vlm \
+--vlm_model_path /datacc05/hongjiacheng/qwen_hub/Qwen3-VL-4B-Instruct \
+--vlm_python /home/hongjiacheng/miniconda3/envs/fixanything/bin/python \
+--vlm_device cuda:0 \
+--vlm_max_image_size 1024 \
+--vlm_max_new_tokens 768
+```
+
+The VLM runs in a subprocess and exits before refinement, releasing its GPU
+allocation. This allows the existing `skyfall-gs` training environment to retain
+Transformers 4.46.3; the selected VLM interpreter must support
+`Qwen3VLForConditionalGeneration` (locally verified with Transformers 4.57.6).
+Weights and processor files are loaded locally only. `--vlm_device` uses the
+process-visible CUDA index, respecting `CUDA_VISIBLE_DEVICES`.
+
+Use either `--vlm_model_path` or recorded `--prompt_json`. `sr_fixed` rejects
+both. Prompts include the raw model response and model/inference provenance;
+shared-region semantics are supplied to later levels. Cached prompts avoid
+loading the VLM again. Invalid or truncated JSON raises an error rather than
+silently switching to fixed prompts; increase the token limit if necessary.
+The supplied checkpoint is the standard Qwen3-VL Instruct model, not the
+Chain-of-Zoom fine-tuned model used in GaussianZoom. SR still requires its own
+backend/model configuration.
