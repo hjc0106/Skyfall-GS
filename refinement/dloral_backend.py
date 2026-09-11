@@ -167,6 +167,8 @@ class DLoRALBackend(Refiner):
         mixed_precision: str = "fp16",
         prompt_max_chars: int = 300,
         alignment: str = "spynet",
+        max_roundtrip_error_px: float | None = None,
+        dump_spatial_features: bool = False,
     ):
         if alignment not in ("spynet", "geometry", "target_only"):
             raise ValueError("dloral alignment must be 'spynet', 'geometry', or 'target_only'")
@@ -188,6 +190,10 @@ class DLoRALBackend(Refiner):
         self.latent_tiled_overlap = int(latent_tiled_overlap)
         self.mixed_precision = mixed_precision
         self.prompt_max_chars = int(prompt_max_chars)
+        self.max_roundtrip_error_px = (
+            None if max_roundtrip_error_px is None else float(max_roundtrip_error_px)
+        )
+        self.dump_spatial_features = bool(dump_spatial_features)
         if self.upscale < 1:
             raise ValueError("dloral upscale must be >= 1")
         interpreter = shutil.which(self.python) or self.python
@@ -221,6 +227,8 @@ class DLoRALBackend(Refiner):
             "upscale": self.upscale,
             "align_method": self.align_method,
             "alignment": self.alignment,
+            "max_roundtrip_error_px": self.max_roundtrip_error_px,
+            "dump_spatial_features": self.dump_spatial_features,
             "latent_tiled_size": self.latent_tiled_size,
             "vae_encoder_tiled_size": self.vae_encoder_tiled_size,
             "frame_order": ["neighbor", "target"],
@@ -257,6 +265,7 @@ class DLoRALBackend(Refiner):
                     process_size=self.process_size,
                     upscale=self.upscale,
                     neighbor_contribution=neighbor_contribution,
+                    max_roundtrip_error_px=self.max_roundtrip_error_px,
                 )
             elif self.alignment == "target_only":
                 geometry_info = pixel_flow_to_external_flows(
@@ -303,6 +312,7 @@ class DLoRALBackend(Refiner):
                 "tiled": tiled,
                 "vae_downsample": VAE_DOWNSAMPLE,
                 "dump_diagnostics": True,
+                "dump_spatial_features": self.dump_spatial_features,
             }
             if geometry_info is not None:
                 flow_paths = pack_external_flows_for_worker(geometry_info, root)
@@ -310,6 +320,8 @@ class DLoRALBackend(Refiner):
                 payload["geometry_coverage"] = geometry_info["coverage"]
                 payload["reverse_source"] = geometry_info.get("reverse_source")
                 payload["roundtrip"] = geometry_info.get("roundtrip")
+                payload["image_roundtrip"] = geometry_info.get("image_roundtrip")
+                payload["roundtrip_gate"] = geometry_info.get("roundtrip_gate")
             (root / "request.json").write_text(json.dumps(payload), encoding="utf-8")
             worker = Path(__file__).with_name("dloral_worker.py")
             project_root = Path(__file__).resolve().parents[1]
@@ -323,6 +335,13 @@ class DLoRALBackend(Refiner):
                 if not existing_pythonpath
                 else str(project_root) + os.pathsep + existing_pythonpath
             )
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             completed = subprocess.run(
                 [self.python, str(worker), str(root)],
                 check=False,
@@ -356,11 +375,15 @@ class DLoRALBackend(Refiner):
                 if geometry_info is not None:
                     persist_payload["external_flows"] = pack_external_flows_for_worker(geometry_info, persist)
                     persist_payload["roundtrip"] = geometry_info.get("roundtrip")
+                    persist_payload["image_roundtrip"] = geometry_info.get("image_roundtrip")
+                    persist_payload["roundtrip_gate"] = geometry_info.get("roundtrip_gate")
                     persist_payload["reverse_source"] = geometry_info.get("reverse_source")
                 for extra in ("coverage.png", "feature_diag.json"):
                     extra_path = root / extra
                     if extra_path.is_file():
                         shutil.copy2(extra_path, persist / extra)
+                for extra_path in sorted(root.glob("spatial_*.npy")):
+                    shutil.copy2(extra_path, persist / extra_path.name)
                 (persist / "request.json").write_text(
                     json.dumps(to_jsonable(persist_payload), indent=2), encoding="utf-8"
                 )
@@ -393,6 +416,8 @@ class DLoRALBackend(Refiner):
             "geometry_coverage": None if geometry_info is None else geometry_info["coverage"],
             "reverse_source": None if geometry_info is None else geometry_info.get("reverse_source"),
             "roundtrip": None if geometry_info is None else geometry_info.get("roundtrip"),
+            "image_roundtrip": None if geometry_info is None else geometry_info.get("image_roundtrip"),
+            "roundtrip_gate": None if geometry_info is None else geometry_info.get("roundtrip_gate"),
             "worker": info,
         }
         return RefinementResult(image=output, backend=self.name, metadata=to_jsonable(dict(metadata)))

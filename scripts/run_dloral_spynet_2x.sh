@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-/datacc05/hongjiacheng/sr_models/dloral}"
+WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-$ROOT/weights/dloral}"
 SD_DIR="${DLORAL_SD_PATH:-$WEIGHT_ROOT/stable-diffusion-2-1-base}"
 CKPT="${DLORAL_CKPT:-$WEIGHT_ROOT/model.pkl}"
 SPYNET="${DLORAL_SPYNET:-$WEIGHT_ROOT/spynet_20210409-c6c1bd09.pth}"

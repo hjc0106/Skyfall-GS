@@ -19,6 +19,7 @@ from refinement.dloral_flows import (
     crop_feature_flow,
     downsample_image_flow,
     fuse_with_valid_mask,
+    gate_valid_with_roundtrip,
     hw2_to_nchw,
     invert_feature_flow,
     iter_dloral_latent_tiles,
@@ -265,6 +266,81 @@ class DLoRALFlowAdapterTests(unittest.TestCase):
         self.assertEqual(float(aligned[1, 0, 0, 0].item()), 0.0)
         cropped = aligned[:, :, 0:4, 0:4]
         self.assertAlmostEqual(float(cropped[0, 0, 0, 0].item()), 3.0, places=4)
+
+    def test_roundtrip_gate_uses_image_pixels_before_downsample(self) -> None:
+        size = 16
+        forward = torch.zeros(size, size, 2)
+        reverse = torch.zeros(size, size, 2)
+        forward[..., 0] = 3.0
+        valid = torch.ones(size, size, dtype=torch.bool)
+        correspondence = GeometryCorrespondence(
+            target_to_source_flow=forward,
+            valid_mask=valid,
+            source_size=(size, size),
+            target_size=(size, size),
+            source_to_target_flow=reverse,
+            reverse_valid_mask=valid,
+        )
+        ungated = correspondence_to_external_flows(correspondence, process_size=8, upscale=1)
+        self.assertGreater(ungated["coverage"], 0.9)
+        self.assertGreater(ungated["image_roundtrip"]["median_roundtrip_error_px"], 2.5)
+        self.assertLess(ungated["roundtrip"]["median_roundtrip_error_px"], 0.5)
+        gated = correspondence_to_external_flows(
+            correspondence, process_size=8, upscale=1, max_roundtrip_error_px=1.0,
+        )
+        self.assertEqual(gated["coverage"], 0.0)
+        self.assertTrue(gated["roundtrip_gate"]["applied_before_feature_downsample"])
+        kept = correspondence_to_external_flows(
+            correspondence, process_size=8, upscale=1, max_roundtrip_error_px=4.0,
+        )
+        self.assertGreater(kept["coverage"], 0.9)
+
+    def test_consistent_dual_depth_survives_one_pixel_gate(self) -> None:
+        size = 16
+        forward = torch.zeros(size, size, 2)
+        reverse = torch.zeros(size, size, 2)
+        forward[..., 0] = 2.0
+        reverse[..., 0] = -2.0
+        valid = torch.ones(size, size, dtype=torch.bool)
+        fwd_gated, rev_gated, error, _ = gate_valid_with_roundtrip(
+            forward, valid, reverse, valid, max_error_px=1.0,
+        )
+        self.assertGreater(float(fwd_gated.float().mean().item()), 0.85)
+        self.assertLess(float(error[fwd_gated].median().item()), 0.1)
+        with self.assertRaises(ValueError):
+            correspondence_to_external_flows(
+                GeometryCorrespondence(
+                    target_to_source_flow=forward,
+                    valid_mask=valid,
+                    source_size=(size, size),
+                    target_size=(size, size),
+                ),
+                process_size=8,
+                max_roundtrip_error_px=1.0,
+            )
+
+    def test_spatial_tile_average_and_jsonable_dump(self) -> None:
+        from refinement.dloral_flows import (
+            accumulate_feature_tile,
+            finalize_spatial_maps,
+            jsonable_feature_dump,
+        )
+
+        dump = {"dump_spatial": True, "spatial_hw": (4, 4), "_tile_origin": (0, 0)}
+        left = torch.ones(2, 2, 2)
+        right = torch.full((2, 2, 2), 3.0)
+        accumulate_feature_tile(dump, "fused", left, top=0, left=0, full_hw=(4, 4))
+        accumulate_feature_tile(dump, "fused", right, top=0, left=1, full_hw=(4, 4))
+        maps = finalize_spatial_maps(dump)
+        self.assertEqual(tuple(maps["fused"].shape), (2, 4, 4))
+        self.assertTrue(torch.allclose(maps["fused"][:, 0, 0], torch.ones(2)))
+        self.assertTrue(torch.allclose(maps["fused"][:, 0, 1], torch.full((2,), 2.0)))
+        self.assertTrue(torch.allclose(maps["fused"][:, 0, 2], torch.full((2,), 3.0)))
+        dump["coverage"] = 0.5
+        jsonable = jsonable_feature_dump(dump)
+        self.assertEqual(jsonable["coverage"], 0.5)
+        self.assertNotIn("spatial_fused", jsonable)
+        self.assertNotIn("_tile_origin", jsonable)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PIN="$ROOT/submodules/DLoRAL.pin"
 ENV_NAME="${DLORAL_ENV_NAME:-dloral}"
 CONDA_BIN="${CONDA_BIN:-$HOME/miniconda3/bin/conda}"
-WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-/datacc05/hongjiacheng/sr_models/dloral}"
+WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-$ROOT/weights/dloral}"
 
 echo "DLoRAL pin:"
 cat "$PIN"

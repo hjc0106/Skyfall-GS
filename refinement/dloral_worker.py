@@ -244,6 +244,9 @@ def worker(directory: str) -> None:
                 f"flow valid_mask spatial {tuple(valid_mask.shape[-2:])} != latent {(feat_h, feat_w)}"
             )
         dump: dict = {}
+        if request.get("dump_spatial_features"):
+            dump["dump_spatial"] = True
+            dump["spatial_hw"] = (feat_h, feat_w)
         if tiled:
             wrap_vae_neighbor_alignment(model, flows_forward, valid_mask)
             wrap_cfr_geometry_alignment(
@@ -296,11 +299,20 @@ def worker(directory: str) -> None:
     peak = None
     if torch.cuda.is_available():
         peak = int(torch.cuda.max_memory_allocated())
+    scalar_dump: dict = {}
     if dump:
+        from refinement.dloral_flows import finalize_spatial_maps, jsonable_feature_dump
+
+        scalar_dump = jsonable_feature_dump(dump)
         (root / "feature_diag.json").write_text(
-            json.dumps({key: dump[key] for key in dump if key != "coverage_mask"}, default=float),
+            json.dumps(scalar_dump, default=float),
             encoding="utf-8",
         )
+        if dump.get("dump_spatial"):
+            import numpy as np
+
+            for name, tensor in finalize_spatial_maps(dump).items():
+                np.save(root / f"spatial_{name}.npy", tensor.numpy())
         if alignment in ("geometry", "target_only"):
             import numpy as np
             from PIL import Image as PILImage
@@ -332,7 +344,7 @@ def worker(directory: str) -> None:
                     if alignment == "target_only"
                     else "native_spynet"
                 ),
-                "feature_diag": {key: dump[key] for key in dump},
+                "feature_diag": scalar_dump if dump else {},
                 "offline": True,
             },
             default=float,

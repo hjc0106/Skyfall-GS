@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-/datacc05/hongjiacheng/sr_models/dloral}"
+WEIGHT_ROOT="${DLORAL_WEIGHT_ROOT:-$ROOT/weights/dloral}"
 export DLORAL_PYTHON="${DLORAL_PYTHON:-$HOME/miniconda3/envs/dloral/bin/python}"
 export DLORAL_DEVICE="${DLORAL_DEVICE:-cuda:2}"
 PAIR_DIR="${DLORAL_GEOMETRY_DIR:-$ROOT/skyfall-gs_exp/dloral_geometry_pair}"

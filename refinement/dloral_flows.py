@@ -287,13 +287,20 @@ def sample_flow_at(flow_hw2: torch.Tensor, uv: torch.Tensor, valid: torch.Tensor
     return sampled, sampled_valid
 
 
-def roundtrip_diagnostics(
+def roundtrip_error_map(
     forward_hw2: torch.Tensor,
     forward_valid: torch.Tensor,
     reverse_hw2: torch.Tensor,
     reverse_valid: torch.Tensor,
-) -> dict[str, float]:
-    """Compose target→source→target using two independently computed fields."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-resolution target→source→target error.
+
+    A pixel is a hit only when the forward sample is geometrically valid, the
+    reverse field is valid at the landed source coordinate, and the composed
+    location is finite.  Error is in **image pixels**, not feature pixels.
+    Out-of-bounds and reverse-invalid samples are excluded here, before any
+    downsample.
+    """
 
     height, width = forward_valid.shape
     device = forward_hw2.device
@@ -307,16 +314,24 @@ def roundtrip_diagnostics(
         indexing="ij",
     )
     origin = torch.stack((xs, ys), dim=-1)
-    source = origin + forward_hw2
-    reverse_at_source, reverse_hit = sample_flow_at(
-        reverse_hw2.to(device=device),
-        source,
-        reverse_valid.to(device=device),
-    )
-    back = source + reverse_at_source
-    error = (back - origin).norm(dim=-1)
-    both = forward_valid & reverse_hit & torch.isfinite(error)
-    count = int(both.sum().item())
+    source = origin + forward_hw2.to(device=device)
+    reverse_at_source, reverse_hit = sample_flow_at(reverse_hw2, source, reverse_valid)
+    error = (source + reverse_at_source - origin).norm(dim=-1)
+    hit = forward_valid & reverse_hit & torch.isfinite(error)
+    nan = torch.full_like(error, float("nan"))
+    return torch.where(hit, error, nan), hit
+
+
+def roundtrip_diagnostics(
+    forward_hw2: torch.Tensor,
+    forward_valid: torch.Tensor,
+    reverse_hw2: torch.Tensor,
+    reverse_valid: torch.Tensor,
+) -> dict[str, float]:
+    """Compose target→source→target using two independently computed fields."""
+
+    error, hit = roundtrip_error_map(forward_hw2, forward_valid, reverse_hw2, reverse_valid)
+    count = int(hit.sum().item())
     if count == 0:
         return {
             "forward_coverage": float(forward_valid.float().mean().item()),
@@ -329,11 +344,34 @@ def roundtrip_diagnostics(
     return {
         "forward_coverage": float(forward_valid.float().mean().item()),
         "reverse_coverage": float(reverse_valid.float().mean().item()),
-        "roundtrip_hit_rate": float(both.float().mean().item()),
-        "median_roundtrip_error_px": float(error[both].median().item()),
-        "mean_roundtrip_error_px": float(error[both].mean().item()),
+        "roundtrip_hit_rate": float(hit.float().mean().item()),
+        "median_roundtrip_error_px": float(error[hit].median().item()),
+        "mean_roundtrip_error_px": float(error[hit].mean().item()),
         "hit_pixels": count,
     }
+
+
+def gate_valid_with_roundtrip(
+    forward_hw2: torch.Tensor,
+    forward_valid: torch.Tensor,
+    reverse_hw2: torch.Tensor,
+    reverse_valid: torch.Tensor,
+    *,
+    max_error_px: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep geometry-valid pixels only when full-res roundtrip is within ``max_error_px``.
+
+    Both directions are gated independently from dual-depth fields.  This is an
+    alignment-validity rule, not an RGB residual test.
+    """
+
+    if float(max_error_px) < 0:
+        raise ValueError(f"max_error_px must be >= 0, got {max_error_px}")
+    fwd_error, fwd_hit = roundtrip_error_map(forward_hw2, forward_valid, reverse_hw2, reverse_valid)
+    rev_error, rev_hit = roundtrip_error_map(reverse_hw2, reverse_valid, forward_hw2, forward_valid)
+    fwd_gated = fwd_hit & (fwd_error <= float(max_error_px))
+    rev_gated = rev_hit & (rev_error <= float(max_error_px))
+    return fwd_gated, rev_gated, fwd_error, rev_error
 
 
 def hw2_to_nchw(flow_hw2: torch.Tensor) -> torch.Tensor:
@@ -596,22 +634,41 @@ def _map_one_flow(
     max_flow_std: float,
     valid: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    flow_hw2, mask = _prepared_image_flow(
+        flow, image_size=image_size, prepared_size=prepared_size, valid=valid,
+    )
+    return downsample_image_flow(
+        flow_hw2,
+        downsample=downsample,
+        min_valid_fraction=min_valid_fraction,
+        max_flow_std=max_flow_std,
+        valid=mask,
+    )
+
+
+def _prepared_image_flow(
+    flow: Any,
+    *,
+    image_size: tuple[int, int],
+    prepared_size: tuple[int, int],
+    valid: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     flow_hw2 = _as_hw2(flow)
     src_w, src_h = int(image_size[0]), int(image_size[1])
     dst_w, dst_h = prepared_size
-    mask = valid_mask_from_flow(flow_hw2) if valid is None else _as_mask(valid, (flow_hw2.shape[0], flow_hw2.shape[1]))
+    if tuple(flow_hw2.shape[:2]) != (src_h, src_w):
+        raise ValueError(
+            f"pixel_flow spatial {tuple(flow_hw2.shape[:2])} "
+            f"does not match source_size {(src_w, src_h)}"
+        )
+    mask = valid_mask_from_flow(flow_hw2) if valid is None else _as_mask(valid, (src_h, src_w))
     resized = resize_pixel_flow(
         flow_hw2,
         source_size=(src_w, src_h),
         target_size=(dst_w, dst_h),
         valid=mask,
     )
-    return downsample_image_flow(
-        resized,
-        downsample=downsample,
-        min_valid_fraction=min_valid_fraction,
-        max_flow_std=max_flow_std,
-    )
+    return resized, valid_mask_from_flow(resized)
 
 
 def correspondence_to_external_flows(
@@ -623,23 +680,28 @@ def correspondence_to_external_flows(
     min_valid_fraction: float = 0.5,
     max_flow_std: float = 4.0,
     neighbor_contribution: bool = True,
+    max_roundtrip_error_px: float | None = None,
 ) -> dict[str, Any]:
-    """Build CFR ``(flows_forward, flows_backward)`` plus a feature-scale valid mask."""
+    """Build CFR ``(flows_forward, flows_backward)`` plus a feature-scale valid mask.
+
+    When ``max_roundtrip_error_px`` is set, dual-depth roundtrip is applied at
+    **image / prepared resolution** and the gated pixel mask is aggregated to
+    features.  Do not compare the image-pixel threshold to feature-pixel
+    roundtrip numbers.
+    """
 
     src_w, src_h = int(correspondence.target_size[0]), int(correspondence.target_size[1])
     dst_w, dst_h = prepared_image_size(src_w, src_h, process_size=process_size, upscale=upscale)
-    feature_flow, feat_valid = _map_one_flow(
+    forward, forward_valid = _prepared_image_flow(
         correspondence.target_to_source_flow,
         image_size=(src_w, src_h),
         prepared_size=(dst_w, dst_h),
-        downsample=downsample,
-        min_valid_fraction=min_valid_fraction,
-        max_flow_std=max_flow_std,
         valid=correspondence.valid_mask,
     )
     reverse_source = "depth"
+    backward = None
+    backward_valid = None
     if correspondence.source_to_target_flow is None:
-        backward, backward_valid = invert_feature_flow(feature_flow, feat_valid)
         reverse_source = "scatter_invert_diagnostic_only"
     else:
         source_w, source_h = int(correspondence.source_size[0]), int(correspondence.source_size[1])
@@ -649,14 +711,56 @@ def correspondence_to_external_flows(
                 "DLoRAL dual-view path requires neighbor and target prepared sizes to match, "
                 f"got source {source_prepared} vs target {(dst_w, dst_h)}"
             )
-        backward, backward_valid = _map_one_flow(
+        backward, backward_valid = _prepared_image_flow(
             correspondence.source_to_target_flow,
             image_size=(source_w, source_h),
             prepared_size=source_prepared,
+            valid=correspondence.reverse_valid_mask,
+        )
+    image_roundtrip = None
+    roundtrip_gate = {
+        "max_error_px": None if max_roundtrip_error_px is None else float(max_roundtrip_error_px),
+        "units": "image_pixels",
+        "applied_before_feature_downsample": False,
+        "feature_px_are_not_image_px": True,
+        "downsample": int(downsample),
+        "approx_image_px_per_feature_px": float(downsample),
+    }
+    if backward is not None and backward_valid is not None:
+        image_roundtrip = roundtrip_diagnostics(forward, forward_valid, backward, backward_valid)
+        roundtrip_gate["image_roundtrip"] = image_roundtrip
+        roundtrip_gate["pixel_coverage_before"] = float(forward_valid.float().mean().item())
+    if max_roundtrip_error_px is not None:
+        if backward is None or backward_valid is None:
+            raise ValueError("max_roundtrip_error_px requires dual-depth reverse flow")
+        forward_valid, backward_valid, _, _ = gate_valid_with_roundtrip(
+            forward, forward_valid, backward, backward_valid,
+            max_error_px=float(max_roundtrip_error_px),
+        )
+        nan = torch.full((), float("nan"), dtype=forward.dtype, device=forward.device)
+        forward = torch.where(forward_valid[..., None], forward, nan)
+        backward = torch.where(backward_valid[..., None], backward, nan)
+        roundtrip_gate["applied_before_feature_downsample"] = True
+        roundtrip_gate["pixel_coverage_after"] = float(forward_valid.float().mean().item())
+        roundtrip_gate["image_roundtrip_after"] = roundtrip_diagnostics(
+            forward, forward_valid, backward, backward_valid,
+        )
+    feature_flow, feat_valid = downsample_image_flow(
+        forward,
+        downsample=downsample,
+        min_valid_fraction=min_valid_fraction,
+        max_flow_std=max_flow_std,
+        valid=forward_valid,
+    )
+    if backward is None:
+        backward, backward_valid = invert_feature_flow(feature_flow, feat_valid)
+    else:
+        backward, backward_valid = downsample_image_flow(
+            backward,
             downsample=downsample,
             min_valid_fraction=min_valid_fraction,
             max_flow_std=max_flow_std,
-            valid=correspondence.reverse_valid_mask,
+            valid=backward_valid,
         )
     if not neighbor_contribution:
         feat_valid = torch.zeros_like(feat_valid)
@@ -668,6 +772,8 @@ def correspondence_to_external_flows(
     flows_forward = hw2_to_nchw(feature_flow)
     flows_backward = hw2_to_nchw(backward)
     coverage = float(feat_valid.float().mean().item()) if feat_valid.numel() else 0.0
+    roundtrip_gate["feature_roundtrip"] = roundtrip
+    roundtrip_gate["feature_coverage"] = coverage
     return {
         "flows_forward": flows_forward,
         "flows_backward": flows_backward,
@@ -687,6 +793,8 @@ def correspondence_to_external_flows(
         "invalid": "nan_on_disk_zero_in_network",
         "reverse_source": reverse_source,
         "roundtrip": roundtrip,
+        "image_roundtrip": image_roundtrip,
+        "roundtrip_gate": roundtrip_gate,
         "metadata": {
             "valid_feature_pixels": int(feat_valid.sum().item()),
             "feature_hw": [int(feature_flow.shape[0]), int(feature_flow.shape[1])],
@@ -694,6 +802,7 @@ def correspondence_to_external_flows(
             "max_flow_std": float(max_flow_std),
             "neighbor_contribution": bool(neighbor_contribution),
             "reverse_source": reverse_source,
+            "max_roundtrip_error_px": None if max_roundtrip_error_px is None else float(max_roundtrip_error_px),
         },
     }
 
@@ -712,6 +821,7 @@ def pixel_flow_to_external_flows(
     reverse_valid_mask: Any = None,
     neighbor_contribution: bool = True,
     source_size: tuple[int, int] | None = None,
+    max_roundtrip_error_px: float | None = None,
 ) -> dict[str, Any]:
     """Build CFR flows from a stored target→source ``pixel_flow`` field."""
 
@@ -734,6 +844,7 @@ def pixel_flow_to_external_flows(
         min_valid_fraction=min_valid_fraction,
         max_flow_std=max_flow_std,
         neighbor_contribution=neighbor_contribution,
+        max_roundtrip_error_px=max_roundtrip_error_px,
     )
 
 
@@ -752,6 +863,66 @@ def pack_external_flows_for_worker(payload: Mapping[str, Any], directory, *, pre
     np.save(paths["flows_backward"], payload["flows_backward"].detach().cpu().float().numpy())
     np.save(paths["valid_mask"], payload["valid_mask"].detach().cpu().bool().numpy())
     return {key: str(path) for key, path in paths.items()}
+
+
+def accumulate_feature_tile(
+    dump: dict[str, Any],
+    name: str,
+    tile: torch.Tensor,
+    *,
+    top: int,
+    left: int,
+    full_hw: tuple[int, int],
+) -> None:
+    """Add a CFR tile into a full-resolution sum/count buffer on ``dump``."""
+
+    plane = tile.detach().float().cpu()
+    if plane.ndim == 2:
+        plane = plane[None]
+    if plane.ndim != 3:
+        raise ValueError(f"expected [C,H,W] tile, got {tuple(plane.shape)}")
+    height, width = int(full_hw[0]), int(full_hw[1])
+    key = f"spatial_{name}"
+    count_key = f"spatial_{name}_count"
+    if key not in dump:
+        dump[key] = torch.zeros(plane.shape[0], height, width)
+        dump[count_key] = torch.zeros(height, width)
+    tile_h, tile_w = plane.shape[-2:]
+    dump[key][:, top : top + tile_h, left : left + tile_w] += plane
+    dump[count_key][top : top + tile_h, left : left + tile_w] += 1.0
+
+
+def finalize_spatial_maps(dump: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    """Average overlapping CFR tiles.  Overlap is a reconstruction, not a network tensor."""
+
+    out: dict[str, torch.Tensor] = {}
+    for key, value in dump.items():
+        if not (key.startswith("spatial_") and not key.endswith("_count")):
+            continue
+        if not isinstance(value, torch.Tensor) or value.ndim != 3:
+            continue
+        count = dump.get(f"{key}_count")
+        if not isinstance(count, torch.Tensor):
+            continue
+        out[key[len("spatial_") :]] = value / count.clamp(min=1.0)
+    return out
+
+
+def jsonable_feature_dump(dump: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop tile buffers so worker JSON cannot leak spatial tensors."""
+
+    skip = {"_tile_origin", "coverage_mask"}
+    out: dict[str, Any] = {}
+    for key, value in dump.items():
+        if key in skip or str(key).startswith("spatial_"):
+            continue
+        if isinstance(value, torch.Tensor):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+        elif isinstance(value, (list, tuple, dict)):
+            out[key] = value
+    return out
 
 
 def feature_diagnostics(
@@ -825,6 +996,8 @@ def wrap_cfr_geometry_alignment(
         while mask.ndim > 2:
             mask = mask[0]
         if tuple(mask.shape[-2:]) == (feat_h, feat_w):
+            if dump is not None:
+                dump["_tile_origin"] = (0, 0)
             return mask
         if tile_iter is None:
             raise RuntimeError(
@@ -836,6 +1009,8 @@ def wrap_cfr_geometry_alignment(
             raise RuntimeError("CFR tile count exceeded the official DLoRAL grid.") from exc
         if (tile_h, tile_w) != (feat_h, feat_w):
             raise RuntimeError(f"tile {(tile_h, tile_w)} != CFR spatial {(feat_h, feat_w)}")
+        if dump is not None:
+            dump["_tile_origin"] = (int(top), int(left))
         return mask[top : top + tile_h, left : left + tile_w]
 
     def gated_attn(cur_img, aligned_img, cur_feat, aligned_feat, tile_mask):
@@ -920,6 +1095,26 @@ def wrap_cfr_geometry_alignment(
             )
             dump["valid_coverage"] = float(valid_mask.float().mean().item())
             dump["prealigned"] = bool(prealigned)
+            if dump.get("dump_spatial"):
+                origin = dump.get("_tile_origin") or (0, 0)
+                full_hw = dump.get("spatial_hw") or tuple(valid_mask.shape[-2:])
+                accumulate_feature_tile(
+                    dump, "fused", fused[0, 1], top=int(origin[0]), left=int(origin[1]), full_hw=full_hw
+                )
+                accumulate_feature_tile(
+                    dump, "aligned", aligned[0, 1], top=int(origin[0]), left=int(origin[1]), full_hw=full_hw
+                )
+                accumulate_feature_tile(
+                    dump, "target", vae_feat[0, 1], top=int(origin[0]), left=int(origin[1]), full_hw=full_hw
+                )
+                accumulate_feature_tile(
+                    dump,
+                    "tile_valid",
+                    tile_mask.float().to(device="cpu"),
+                    top=int(origin[0]),
+                    left=int(origin[1]),
+                    full_hw=full_hw,
+                )
         return fused, weight_map, aligned
 
     cfr_module.forward = geometry_forward
@@ -955,8 +1150,11 @@ __all__ = [
     "FLOWS_FORWARD_MEANING",
     "FRAME_ORDER",
     "VAE_DOWNSAMPLE",
+    "accumulate_feature_tile",
     "align_neighbor_latent",
     "apply_aligned_feature_fallback",
+    "finalize_spatial_maps",
+    "jsonable_feature_dump",
     "correspondence_from_neighbor",
     "correspondence_to_external_flows",
     "crop_feature_flow",
@@ -974,8 +1172,10 @@ __all__ = [
     "pack_external_flows_for_worker",
     "pixel_flow_to_external_flows",
     "prepared_image_size",
+    "gate_valid_with_roundtrip",
     "resize_pixel_flow",
     "roundtrip_diagnostics",
+    "roundtrip_error_map",
     "sanitize_flow",
     "sample_flow_at",
     "valid_mask_from_flow",

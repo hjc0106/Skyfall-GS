@@ -235,3 +235,16 @@ __marimo__/
 .streamlit/secrets.toml
 
 
+
+# GSZoom local assets and generated experiment reports
+/skyfall-gs_exp/
+/data/StaDy4D/
+/weights/
+/pelican-bicycle.html
+/docs/figures/
+/docs/lod_panel_3roi/
+/docs/lod_jax214/
+/submodules/DLoRAL/assets/
+/submodules/DLoRAL/preset_models/
+/submodules/DLoRAL/preset/models/
+/submodules/diff-gaussian-rasterization/third_party/

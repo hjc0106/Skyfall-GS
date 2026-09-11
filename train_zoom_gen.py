@@ -118,12 +118,16 @@ def _fractional_crop(width: int, height: int, box: tuple[float, float, float, fl
     return max(0, x0), max(0, y0), min(width, max(x0 + 1, x1)), min(height, max(y0 + 1, y1))
 
 
-def pick_base_camera(scene: Scene, view_index: int, use_test: bool):
+def pick_base_camera(scene: Scene, view_index: int, use_test: bool, image_name: str | None = None):
+    from lod.camera import resolve_scene_camera
+
     cameras = scene.getTestCameras() if use_test else scene.getTrainCameras()
-    if view_index < 0 or view_index >= len(cameras):
-        split = "test" if use_test else "train"
-        raise IndexError(f"view_index={view_index} out of range for {split} cameras (count={len(cameras)}).")
-    return cameras[view_index], not use_test
+    split = "test" if use_test else "train"
+    name = str(image_name or "").strip() or None
+    camera, _index = resolve_scene_camera(
+        cameras, view_index=view_index, image_name=name, split=split,
+    )
+    return camera, not use_test
 
 
 @torch.no_grad()
@@ -1042,6 +1046,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_checkpoint", type=str, required=True, help="Stage1 checkpoint (.pth), read-only")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for this generation run")
     parser.add_argument("--view_index", type=int, default=0)
+    parser.add_argument("--view_name", type=str, default="", help="Lock the base camera by image stem. Preferred over view_index.")
     parser.add_argument("--use_test_view", action="store_true")
     parser.add_argument("--roi_center_x", type=float, required=True)
     parser.add_argument("--roi_center_y", type=float, required=True)
@@ -1282,7 +1287,7 @@ def main() -> None:
 
     train_cameras = scene.getTrainCameras()
     test_cameras = scene.getTestCameras()
-    base_camera, is_train_view = pick_base_camera(scene, args.view_index, args.use_test_view)
+    base_camera, is_train_view = pick_base_camera(scene, args.view_index, args.use_test_view, image_name=args.view_name)
     appearance_embedding = select_appearance_embedding(gaussians, base_camera.uid, is_train_view)
 
     gaussians.training_setup(opt, num_train_cameras=len(train_cameras), from_scratch=False)

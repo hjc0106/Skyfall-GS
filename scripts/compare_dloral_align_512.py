@@ -23,7 +23,7 @@ from refinement.types import CameraSnapshot, MultiViewInput, PromptDescription, 
 
 DEFAULT_BASELINE = Path("skyfall-gs_exp/zoom_gen_dloral_spynet_2x/zoom_2x")
 DEFAULT_OUT = Path("skyfall-gs_exp/zoom_gen_dloral_align_512")
-WEIGHT_ROOT = Path(os.environ.get("DLORAL_WEIGHT_ROOT", "/datacc05/hongjiacheng/sr_models/dloral"))
+WEIGHT_ROOT = Path(os.environ.get("DLORAL_WEIGHT_ROOT", "weights/dloral"))
 NEIGHBOR_FLOW = "geometry_neighbor_1_JAX_068_019_RGB_zoom2_spatial_pixel_flow.npy"
 
 

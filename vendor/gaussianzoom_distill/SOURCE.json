@@ -1,0 +1,14 @@
+{
+  "origin": "Project-local GaussianZoom_distill implementation; not official GaussianZoom source",
+  "snapshot": "2026-09-11",
+  "sha256": {
+    "__init__.py": "e836e1bf4edeced97daae85ae71e5dd520ff52b785aa7f98772bb222c744146f",
+    "camera.py": "14fb14e72478cadf8f300d8440b12371f88f5b31b3504cfb657a4dcde764025f",
+    "train.py": "ea13168ccde79e44569c2529405e3bc3da83f32817207e7ce88bd14f7c424325",
+    "losses.py": "38933d9e1e2577e56b8b4394e22a03f543bae1a13c909b955f3890e0f19e0ec0",
+    "stages.py": "2911014c7cb83d8b3603cfc5379a7f369eaab5a377f9333244a7b8b1bdc52d0b",
+    "data.py": "b667dfd5f32eea9358a9bf417a0369c48ccc53fa5aac8893516e9be1633a756a",
+    "model.py": "0503f88cd42273b5e73bf462e13c8f63d12f6d18a4f16ea97a73942272856ef9",
+    "renderer.py": "33ef22f745c8f02f80dc66acb2ce5246b5a7212732ec107e9167aacc872a9a72"
+  }
+}

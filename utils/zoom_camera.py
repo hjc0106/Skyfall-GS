@@ -63,6 +63,24 @@ class NormalizedROI:
                 f"Zoom-{zoom_factor:g} crop centered at y={self.center_y:.4f} exceeds image vertically."
             )
 
+    def min_zoom_factor(self) -> float:
+        """Smallest focal zoom whose ROI-centered crop still fits in the image."""
+
+        self.validate_in_bounds()
+        return max(
+            0.5 / max(self.center_x, 1e-8),
+            0.5 / max(1.0 - self.center_x, 1e-8),
+            0.5 / max(self.center_y, 1e-8),
+            0.5 / max(1.0 - self.center_y, 1e-8),
+        )
+
+    def zoom_is_valid(self, zoom_factor: float) -> bool:
+        try:
+            self.validate_for_zoom(zoom_factor)
+            return True
+        except ValueError:
+            return False
+
 
 def zoom_fov(base_fov: float, zoom_factor: float) -> float:
     return 2.0 * math.atan(math.tan(base_fov / 2.0) / zoom_factor)

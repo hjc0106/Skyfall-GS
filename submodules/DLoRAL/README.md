@@ -1,0 +1,183 @@
+<div align="center">
+<h2>One-Step Diffusion for Detail-Rich and Temporally Consistent Video Super-Resolution</h2>
+
+[Yujing Sun](https://yjsunnn.github.io/)<sup>1,2, *</sup> | 
+[Lingchen Sun](https://scholar.google.com/citations?hl=zh-CN&tzom=-480&user=ZCDjTn8AAAAJ)<sup>1,2, *</sup> | 
+[Shuaizheng Liu](https://scholar.google.com/citations?user=wzdCc-QAAAAJ&hl=en)<sup>1,2</sup> | 
+[Rongyuan Wu](https://scholar.google.com/citations?user=A-U8zE8AAAAJ&hl=zh-CN)<sup>1,2</sup> | 
+[Zhengqiang Zhang](https://scholar.google.com.tw/citations?user=UX26wSMAAAAJ&hl=en)<sup>1,2</sup> | 
+[Lei Zhang](https://www4.comp.polyu.edu.hk/~cslzhang)<sup>1,2</sup>
+
+<sup>1</sup>The Hong Kong Polytechnic University, <sup>2</sup>OPPO Research Institute
+
+<h3>📍  NeurIPS 2025</h3>
+
+</div>
+
+<div>
+    <h4 align="center">
+        <a href="https://yjsunnn.github.io/DLoRAL-project/" target='_blank'>
+        <img src="https://img.shields.io/badge/💡-Project%20Page-gold">
+        </a>
+        <a href="https://arxiv.org/pdf/2506.15591" target='_blank'>
+        <img src="https://img.shields.io/badge/arXiv-2312.06640-b31b1b.svg">
+        </a>
+        <a href="https://www.youtube.com/embed/Jsk8zSE3U-w?si=jz1Isdzxt_NqqDFL&vq=hd1080" target='_blank'>
+        <img src="https://img.shields.io/badge/Demo%20Video-%23FF0000.svg?logo=YouTube&logoColor=white">
+        </a>
+        <a href="https://www.youtube.com/embed/xzZL8X10_KU?si=vOB3chIa7Zo0l54v" target="_blank">
+        <img src="https://img.shields.io/badge/2--Min%20Explainer-brightgreen?logo=YouTube&logoColor=white">
+        </a>
+        </a>
+        <a href="https://zhuanlan.zhihu.com/p/1959430260706744130" target="_blank">
+        <img src="https://img.shields.io/badge/Zhihu-0084FF?style=flat&logo=zhihu&logoColor=white">
+        </a>
+        </a>
+        <a href="https://github.com/yjsunnn/Awesome-video-super-resolution-diffusion" target="_blank">
+        <img src="https://img.shields.io/badge/GitHub-Awesome--VSR--Diffusion-181717.svg?logo=github&logoColor=white">
+        </a>
+        </a>
+        <a href="https://colab.research.google.com/drive/1QAEn4uFe4GNqlJbogxxhdGFhzMr3rfGm?usp=sharing" target="_blank">
+        <img src="https://img.shields.io/badge/Colab%20Demo-F9AB00?style=flat&logo=googlecolab&logoColor=white">
+        </a>
+        <a href="https://github.com/yjsunnn/DLoRAL" target='_blank' style="text-decoration: none;"><img src="https://visitor-badge.laobi.icu/badge?page_id=yjsunnn/DLoRAL"></a>
+    </h4>
+</div>
+
+<p align="center">
+
+<img src="assets/visual_results.svg" alt="Visual Results">
+
+</p>
+
+## ⏰ Update
+
+- **2025.10.16**: We update [**an improved version**](https://drive.google.com/file/d/1C2TLERta3a-PkoMpqQhHoM_S54pNEASO/view?usp=drive_link) of DLoRAL. Thanks [@Feynman1999](https://github.com/Feynman1999) for the bug fixes!
+- **2025.09.18**: DLoRAL is accepted by **NIPS2025** 🎉
+- **2025.07.14**: [**Colab demo**](https://colab.research.google.com/drive/1QAEn4uFe4GNqlJbogxxhdGFhzMr3rfGm?usp=sharing) is available. ✨ **No local GPU or setup needed** - just upload and enhance!
+- **2025.07.08**: The inference code and pretrained weights are available.
+- **2025.06.24**: The project page is available, including a brief 2-minute explanation video, more visual results and relevant researches.
+- **2025.06.17**: The repo is released.
+
+:star: If DLoRAL is helpful to your videos or projects, please help star this repo. Thanks! :hugs:
+
+😊 You may also want to check our relevant works:
+
+1. **OSEDiff (NIPS2024)** [Paper](https://arxiv.org/abs/2406.08177) | [Code](https://github.com/cswry/OSEDiff/)  
+
+   Real-time Image SR algorithm that has been applied to the OPPO Find X8 series.
+
+2. **PiSA-SR (CVPR2025)** [Paper](https://arxiv.org/pdf/2412.03017) | [Code](https://github.com/csslc/PiSA-SR) 
+
+   Pioneering exploration of Dual-LoRA paradigm in Image SR.
+3. **TVT-SR (ICCV2025)** [Paper](https://arxiv.org/pdf/2507.20291) | [Code](https://github.com/Joyies/TVT)
+   
+   A compact VAE and compute-efficient UNet able to handle fine-grained structures.
+
+5. **Awesome Diffusion Models for Video Super-Resolution** [Repo](https://github.com/yjsunnn/Awesome-video-super-resolution-diffusion)
+
+   A curated list of resources for Video Super-Resolution (VSR) using Diffusion Models.
+
+## 👀 TODO
+- [x] Release inference code.
+- [x] Colab demo for convenient test.
+- [x] Release training code.
+- [ ] Release training data.
+
+
+## 🌟 Overview Framework
+
+<p align="center">
+
+<img src="assets/pipeline.svg" alt="DLoRAL Framework">
+
+</p>
+
+**Training**: A dynamic dual-stage training scheme alternates between optimizing temporal coherence (consistency stage) and refining high-frequency spatial details (enhancement stage) with smooth loss interpolation to ensure stability.
+
+**Inference**: During inference, both C-LoRA and D-LoRA are merged into the frozen diffusion UNet, enabling one-step enhancement of low-quality inputs into high-quality outputs.
+
+
+## 🔧 Dependencies and Installation
+
+1. Clone repo
+    ```bash
+    git clone https://github.com/yjsunnn/DLoRAL.git
+    cd DLoRAL
+    ```
+
+2. Install dependent packages
+    ```bash
+    conda create -n DLoRAL python=3.10 -y
+    conda activate DLoRAL
+    pip install -r requirements.txt
+    # mim install mmedit and mmcv
+    pip install openmim
+    mim install mmcv-full
+    pip install mmedit
+    ```
+
+3. Download Models 
+#### Dependent Models
+* [RAM](https://huggingface.co/spaces/xinyu1205/recognize-anything/blob/main/ram_swin_large_14m.pth) --> put into **/path/to/DLoRAL/preset/models/ram_swin_large_14m.pth**
+* [DAPE](https://drive.google.com/file/d/1KIV6VewwO2eDC9g4Gcvgm-a0LDI7Lmwm/view?usp=drive_link) --> put into **/path/to/DLoRAL/preset/models/DAPE.pth**
+* [Pretrained Weights](https://drive.google.com/file/d/1C2TLERta3a-PkoMpqQhHoM_S54pNEASO/view?usp=drive_link) --> put into **/path/to/DLoRAL/preset/models/checkpoints/model.pkl**
+  - If your goal is to reproduce the results from the paper, we recommend using this version of the [weights](https://drive.google.com/file/d/1ycreq0wxmqVUaN3ORQXJfCtqDyD7RlUV/view?usp=drive_link) instead.
+
+
+Each path can be modified according to its own requirements, and the corresponding changes should also be applied to the command line and the code.
+
+## 🖼️ Quick Inference
+For Real-World Video Super-Resolution:
+
+```
+python src/test_DLoRAL.py     \
+--pretrained_model_path yujingsun/stable-diffusion-2-1-base     \
+--ram_ft_path /path/to/DLoRAL/preset/models/DAPE.pth     \
+--ram_path '/path/to/DLoRAL/preset/models/ram_swin_large_14m.pth'     \
+--merge_and_unload_lora False     \
+--process_size 512     \
+--pretrained_model_name_or_path yujingsun/stable-diffusion-2-1-base     \
+--vae_encoder_tiled_size 4096     \
+--load_cfr     \
+--pretrained_path /path/to/DLoRAL/preset/models/checkpoints/model.pkl     \
+--stages 1     \
+-i /path/to/input_videos/     \
+-o /path/to/results
+```
+
+## ⚙️ Training
+For Real-World Video Super-Resolution:
+
+```
+bash train_scripts.sh
+```
+
+Some key parameters and corresponding meaning:
+Param | Description | Example Value
+--- | --- | ---
+`--quality_iter` | Number of steps for the initial switch from consistency to quality stage | `5000`
+`--quality_iter_1_final` | Number of steps required to switch from the quality stage to the consistency stage | `13000`
+`--quality_iter_2` | Relative number of steps after `quality_iter_1_final` to switch back to the quality stage (actual switch happens at `quality_iter_1_final + quality_iter_2`) | `5000`
+`--lsdir_txt_path` | Dataset path for the first stage | `"/path/to/your/dataset"`
+`--pexel_txt_path` | Dataset path for the second stage | `"/path/to/your/dataset"`
+
+
+
+## 💬 Contact:
+If you have any problem (not only about DLoRAL, but also problems regarding to burst/video super-resolution), please feel free to contact me at yujingsun1999@gmail.com
+
+### Citations
+If our code helps your research or work, please consider citing our paper.
+The following are BibTeX references:
+
+```
+@misc{sun2025onestepdiffusiondetailrichtemporally,
+      title={One-Step Diffusion for Detail-Rich and Temporally Consistent Video Super-Resolution}, 
+      author={Yujing Sun and Lingchen Sun and Shuaizheng Liu and Rongyuan Wu and Zhengqiang Zhang and Lei Zhang},
+      year={2025},
+      eprint={2506.15591},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2506.15591}, 
+}

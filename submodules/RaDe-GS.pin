@@ -1,0 +1,6 @@
+url=https://github.com/HKUST-SAIL/RaDe-GS
+commit=d72f20792005ae1d6555a82aa2d15345f247604e
+path=submodules/diff-gaussian-rasterization
+package=diff_gaussian_rasterization
+glm=copied from submodules/diff-gaussian-rasterization-depth/third_party/glm when missing (g-truc/glm; the rasterizer git submodule is not fetched by sparse clone)
+note=Official RaDe-GS rasterizer used by GaussianZoom_distill. Distinct from Skyfall's diff_gauss (diff-gaussian-rasterization-depth).
