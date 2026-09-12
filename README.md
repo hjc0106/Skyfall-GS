@@ -377,3 +377,9 @@ If you find this work useful, please consider citing:
 ## License
 
 This project is licensed under the terms of the [Apache 2 License](LICENSE).
+
+## Physical Resolution Field (PRF)
+
+独立物理分辨率后处理模块已迁入 [`thirdparty/PRF`](thirdparty/PRF/README.md)。
+输入米制高斯 PLY 和原始训练相机，输出观测、高斯核、采样间距及融合分辨率，
+支持 GS 深度遮挡、冻结几何对照和离线 3D 可视化。安装、运行和测试见模块文档。
