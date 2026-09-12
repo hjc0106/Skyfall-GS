@@ -1,0 +1,4 @@
+-r requirements.txt
+torch
+gsplat==1.4.0
+ninja

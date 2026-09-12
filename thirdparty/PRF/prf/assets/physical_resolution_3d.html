@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PRF 三维 patch 表面场</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: #111315; color: #edf0f2; font: 13px/1.5 system-ui, sans-serif; }
+    body { min-height: 100vh; }
+    #app { display: grid; grid-template-columns: minmax(0, 1fr) 330px; grid-template-rows: auto minmax(520px, 1fr) auto; min-height: 100vh; }
+    header { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 10px 14px; background: #191c1f; border-bottom: 1px solid #30353a; }
+    header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    label { display: inline-flex; align-items: center; gap: 6px; }
+    select, button { background: #24282c; color: #edf0f2; border: 1px solid #48515a; border-radius: 4px; padding: 5px 8px; }
+    button:disabled, select:disabled { opacity: .5; }
+    input { accent-color: #74add1; }
+    input[type="range"] { width: 84px; }
+    output { min-width: 34px; color: #b9c1c8; font-variant-numeric: tabular-nums; }
+    #status { margin-left: auto; color: #aeb7bf; font-variant-numeric: tabular-nums; }
+    #status.error { color: #ff9a9a; }
+    #view { position: relative; min-width: 0; min-height: 520px; overflow: hidden; }
+    canvas.webgl { display: block; width: 100%; height: 100%; touch-action: none; }
+    aside { border-left: 1px solid #30353a; padding: 14px; overflow: auto; background: #16191c; }
+    aside h2 { font-size: 12px; margin: 0 0 9px; color: #b9c1c8; text-transform: uppercase; letter-spacing: .06em; }
+    dl { margin: 0; display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 5px 9px; }
+    dt { color: #8f99a2; }
+    dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+    #image-panel { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(240px, 360px) minmax(260px, 1fr); gap: 16px; align-items: start; padding: 12px 14px; border-top: 1px solid #30353a; background: #16191c; }
+    #preview-wrap { position: relative; width: 100%; max-width: 360px; aspect-ratio: 1; background: #090a0b; overflow: hidden; cursor: zoom-in; }
+    #preview-wrap img, #preview-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }
+    #preview { display: none; }
+    #preview-wrap canvas { pointer-events: none; transform-origin: 50% 50%; will-change: transform; }
+    .camera-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .legend { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #c5ccd2; }
+    .legend-item { white-space: nowrap; }
+    .swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: -1px; }
+    .note { color: #8f99a2; font-size: 12px; margin-top: 10px; }
+    #hint { color: #c1c8ce; }
+    @media (max-width: 900px) {
+      #app { grid-template-columns: 1fr; grid-template-rows: auto 64vh auto auto; }
+      #view { min-height: 420px; }
+      aside { border-left: 0; border-top: 1px solid #30353a; }
+      #image-panel { grid-template-columns: 1fr; }
+      #status { width: 100%; margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main id="app">
+    <header>
+      <h1>物理分辨率场 · 原始 PLY 映射</h1>
+      <div class="controls">
+        <label>场景着色
+          <select id="metric" aria-label="原始 PLY 与 patch 着色指标">
+            <option value="R_phys">R_phys</option>
+            <option value="rgb">原始 RGB</option>
+            <option value="R_obs">R_obs（增强）</option>
+            <option value="R_obs_absolute">R_obs（统一色标）</option>
+            <option value="R_kernel">R_kernel</option>
+            <option value="R_spacing">R_spacing</option>
+            <option value="bottleneck">瓶颈类型</option>
+          </select>
+        </label>
+        <label>映射强度
+          <input type="range" id="field-opacity" min="0" max="100" value="68" />
+          <output id="field-opacity-value">68%</output>
+        </label>
+        <label><input type="checkbox" id="show-gaussians" checked /> 原始 PLY 点</label>
+        <label><input type="checkbox" id="show-patches" /> Patch 表面</label>
+        <label>Patch 透明度
+          <input type="range" id="patch-opacity" min="20" max="90" value="50" />
+          <output id="patch-opacity-value">50%</output>
+        </label>
+        <button type="button" id="view-top">俯视</button>
+        <button type="button" id="view-oblique">斜视</button>
+      </div>
+      <span class="legend" id="resolution-legend" aria-label="绝对物理分辨率色标">
+        <span class="legend-item"><i class="swatch" style="background:#08186b"></i>≤0.5 m</span>
+        <span class="legend-item"><i class="swatch" style="background:#0048a8"></i>0.5–1</span>
+        <span class="legend-item"><i class="swatch" style="background:#008caa"></i>1–2</span>
+        <span class="legend-item"><i class="swatch" style="background:#da9e00"></i>2–5</span>
+        <span class="legend-item"><i class="swatch" style="background:#d74800"></i>5–10</span>
+        <span class="legend-item"><i class="swatch" style="background:#870022"></i>&gt;10 m</span>
+        <span class="legend-item"><i class="swatch" style="background:#787878"></i>INVALID</span>
+      </span>
+      <span class="legend" id="obs-detail-legend" aria-label="R_obs 增强物理分辨率色标" hidden>
+        <span class="legend-item"><i class="swatch" style="background:#08186b"></i>≤0.35 m</span>
+        <span class="legend-item"><i class="swatch" style="background:#003b8f"></i>0.35–0.5</span>
+        <span class="legend-item"><i class="swatch" style="background:#0068c9"></i>0.5–0.75</span>
+        <span class="legend-item"><i class="swatch" style="background:#0097b2"></i>0.75–1</span>
+        <span class="legend-item"><i class="swatch" style="background:#e0a000"></i>1–1.5</span>
+        <span class="legend-item"><i class="swatch" style="background:#d94a00"></i>1.5–2</span>
+        <span class="legend-item"><i class="swatch" style="background:#870022"></i>&gt;2 m</span>
+        <span class="legend-item"><i class="swatch" style="background:#787878"></i>INVALID</span>
+      </span>
+      <span class="legend" id="bottleneck-legend" aria-label="瓶颈类型色标" hidden>
+        <span class="legend-item"><i class="swatch" style="background:#f46d43"></i>KERNEL</span>
+        <span class="legend-item"><i class="swatch" style="background:#4575b4"></i>SPACING</span>
+        <span class="legend-item"><i class="swatch" style="background:#50c850"></i>OBS</span>
+        <span class="legend-item"><i class="swatch" style="background:#787878"></i>INVALID</span>
+      </span>
+      <span id="status" role="status">准备加载…</span>
+    </header>
+
+    <section id="view" aria-label="可交互三维 patch 表面场">
+      <canvas class="webgl" id="c3d"></canvas>
+    </section>
+
+    <aside>
+      <h2>当前 patch</h2>
+      <p id="hint">鼠标旋转、平移和缩放；单击 patch 查看几何、分辨率与观测相机。</p>
+      <dl id="info" hidden></dl>
+      <p class="note">场景颜色直接映射在原始 PLY 的 Gaussian 中心上；Patch 表面仅用于核对局部凸包。</p>
+      <p class="note">可见性为 frustum-only，尚未加入 GS depth 遮挡。</p>
+    </aside>
+
+    <section id="image-panel" aria-label="训练图像联动">
+      <div id="preview-wrap">
+        <img id="preview" alt="训练图像与所选 patch 的投影" />
+        <canvas id="overlay"></canvas>
+      </div>
+      <div>
+        <div class="camera-tools">
+          <label>训练相机
+            <select id="camera" aria-label="训练相机"></select>
+          </label>
+          <button type="button" id="best-a">最佳相机 A</button>
+          <button type="button" id="best-b">最佳相机 B</button>
+        </div>
+        <dl id="image-info"></dl>
+      </div>
+    </section>
+  </main>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.js",
+      "three/addons/": "./vendor/"
+    }
+  }
+  </script>
+  <script type="module" src="./prf-viewer.js?v=7"></script>
+</body>
+</html>

@@ -454,3 +454,9 @@ silently switching to fixed prompts; increase the token limit if necessary.
 The supplied checkpoint is the standard Qwen3-VL Instruct model, not the
 Chain-of-Zoom fine-tuned model used in GaussianZoom. SR still requires its own
 backend/model configuration.
+
+## Physical Resolution Field (PRF)
+
+独立物理分辨率后处理模块已迁入 [`thirdparty/PRF`](thirdparty/PRF/README.md)。
+输入米制高斯 PLY 和原始训练相机，输出观测、高斯核、采样间距及融合分辨率，
+支持 GS 深度遮挡、冻结几何对照和离线 3D 可视化。安装、运行和测试见模块文档。
