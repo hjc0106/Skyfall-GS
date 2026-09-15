@@ -10,6 +10,10 @@
 #
 
 import os
+import copy
+import gc
+import time
+from io import BytesIO
 import numpy as np
 import torch
 import random
@@ -36,8 +40,19 @@ import json
 from PIL import Image
 from submodules.MoGe.idu_depth import MoGeIDU
 
-# pip install diffusers==0.30.1 huggingface-hub==0.33.4 transformers==4.46.3 tokenizers==0.20.3 (default)
-from submodules.FlowEdit.idu_refine import FlowEditRefineIDU 
+from refinement.stage2_gaussianzoom import (
+    prepare_stage2_inputs,
+    refine_stage2_inputs,
+    validate_stage2_options,
+)
+from refinement.types import RenderBundle
+
+from utils.compact_retention import (
+    build_stage_comparison,
+    finalize_episode,
+    prune_stage_scratch,
+    retire_prior_iteration,
+)
 
 # fused SSIM, for faster training
 
@@ -52,16 +67,12 @@ from torchvision.transforms.functional import to_pil_image
 
 try:
     from tensorboardX import SummaryWriter
+    from tensorboardX.proto.summary_pb2 import Summary
+    from tensorboardX.summary import _clean_tag
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-os.makedirs("./depth_tmp", exist_ok=True)
-moge_standalone = MoGeIDU(
-    "./depth_tmp",
-    "cuda:0",
-    60.0
-)
 
 @torch.no_grad()
 def create_offset_gt(image, offset):
@@ -87,6 +98,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("Initialized LPIPS loss")
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    moge_standalone = (
+        MoGeIDU(os.path.join(dataset.model_path, "depth_tmp"), "cuda:0", 60.0)
+        if opt.lambda_pseudo_depth > 0 else None
+    )
     gaussians = GaussianModel(
         dataset.sh_degree,
         dataset.appearance_enabled,
@@ -378,7 +393,7 @@ def write_idu_compare_html(episode_dir: str, n_images: int, episode_idx: int, el
   td, th {{ padding: 6px; vertical-align: top; }}
 </style></head><body>
 <h2>Episode {episode_idx:02d} · e={elevation} · r={radius}</h2>
-<p>left: 3DGS render · middle: FlowEdit · right: after this episode's 3DGS training (filled later)</p>
+<p>left: 3DGS render · middle: GaussianZoom / DLoRAL · right: after this episode's 3DGS training (filled later)</p>
 <table>
 <tr><th>id</th><th>render</th><th>render_refine</th><th>render_after_train</th></tr>
 {''.join(rows)}
@@ -429,215 +444,164 @@ def save_idu_after_train_renders(views, gaussians, pipeline, background, kernel_
 
 
 @torch.no_grad()
-def render_idu_set(views, gaussians, pipeline, background, kernel_size, idu_random_ap=False):
-    imgs = []
-    for view in tqdm(views, desc="IDU Rendering progress"):
-        rendering = render(view, gaussians, pipeline, background, kernel_size=kernel_size, testing=(not idu_random_ap))["render"]
-        img = rendering.cpu().numpy().transpose(1, 2, 0)
-        imgs.append(img)
-    return imgs
-
-@torch.no_grad()
 def generate_idu_training_set(
-    dataset : ModelParams,
-    checkpoint_path : str,
-    pipeline : PipelineParams,
-    targets, elevation, radius, idu_num_cams, idu_num_samples_per_view, height=512, width=512, fov_x=60.0,
-    num_steps: int=50, strength=0.1, guidance_scale=1, eta=0.5,
-    use_flow_edit: bool=False, flow_edit_n_min: int=0, flow_edit_n_max: int=15, flow_edit_n_max_end: int=15, flow_edit_n_avg: int=1, model_type: str="FLUX",
-    use_difix3d: bool=False, difix3d_model: str="nvidia/difix", difix3d_steps: int=1, 
-    use_dreamscene: bool=False, use_sd21: bool=True,
-    difix3d_guidance: float=0.0, difix3d_timesteps: list=None, difix3d_use_reference: bool=False,
-    difix3d_prompt: str="remove degradation",
-    refine=True, idu_no_curriculum=False, idu_random_ap=False,
+    dataset: ModelParams,
+    checkpoint_path: str,
+    pipeline: PipelineParams,
+    targets,
+    elevation,
+    radius,
+    idu_num_cams: int,
+    idu_num_samples_per_view: int,
+    *,
+    options,
+    height: int = 1024,
+    width: int = 1024,
+    fov_x: float = 60.0,
     episode_idx: int = 0,
-    flux_model_path: str | None = None,
 ):
+    """Refine every curriculum view with geometry-guided DLoRAL, then infer depth.
 
-    gaussians = GaussianModel(dataset.sh_degree, dataset.appearance_enabled, dataset.appearance_n_fourier_freqs, dataset.appearance_embedding_dim)
-    print(f"Loading model from checkpoint {checkpoint_path}")
-    (model_params, first_iter) = torch.load(checkpoint_path, weights_only=False)
-    gaussians.load_from_checkpoints(model_params)
-    base_dir = os.path.dirname(checkpoint_path)
-    print(base_dir)
-    scene = Scene(dataset, gaussians, load_iteration=first_iter, shuffle=False, ply_path=base_dir)
-
-    
-    # print(gaussians._xyz.shape)
-    # # print Gaussian scale statistics
-    # gs_scale = gaussians.get_scaling.max(dim=1).values
-    # print("Min: ", gs_scale.min().item())
-    # print("Max: ", gs_scale.max().item())
-    # print("Mean: ", gs_scale.mean().item())
-    # print("Std: ", gs_scale.std().item())
-    # print("Median: ", gs_scale.median().item())
-    # print("Q99: ", gs_scale.kthvalue(int(0.99 * gs_scale.shape[0]), dim=0).values.item())
-    
-    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    kernel_size = dataset.kernel_size
-
-    idu_cam_infos = []
-    if isinstance(elevation, list) and isinstance(radius, list):
-        assert len(elevation) == len(radius)
-        assert idu_no_curriculum, "When using multiple elevations and radii, idu_no_curriculum must be set to True"
-        for ele, rad in zip(elevation, radius):
-            for target in targets:
-                idu_cam_infos += gen_idu_orbit_camera(
-                    target,
-                    ele,
-                    rad,
-                    idu_num_cams,
-                    idu_num_samples_per_view,
-                    height,
-                    width,
-                    fov_x,
-                )
-        num_cams = len(idu_cam_infos)
-        idu_cam_infos = random.sample(idu_cam_infos, num_cams // len(elevation))
-        print("Warning! Sampling a subset of cameras for each elevation/radius pair")
-    else:
-        for target in targets:
-            idu_cam_infos += gen_idu_orbit_camera(
-                target,
-                elevation,
-                radius,
-                idu_num_cams,
-                idu_num_samples_per_view,
-                height,
-                width,
-                fov_x,
-                use_new_id=(not idu_random_ap),
-                num_train_cams=(len(scene.getTrainCameras()) if idu_random_ap else None)
-            )
-    print(f"Generated {len(idu_cam_infos)} IDU cameras")
-
-    cam_lists = cameraList_from_camInfos(idu_cam_infos, 1, dataset, is_pseudo_cam=idu_random_ap)
-    imgs = render_idu_set(cam_lists, gaussians, pipeline, background, kernel_size, idu_random_ap)
+    Rendering/geometry, Qwen/DLoRAL generation, and MoGe depth are separate
+    phases. Only CPU CameraInfo metadata and disk-backed inputs cross phases.
+    """
+    validate_stage2_options(options)
+    if idu_num_cams < 1 or idu_num_samples_per_view < 1:
+        raise ValueError("IDU needs positive camera and per-view sample counts")
 
     episode_name = idu_episode_dirname(episode_idx, elevation, radius)
     episode_root = os.path.join(dataset.model_path, "idu", episode_name)
-    frames_path = os.path.join(episode_root, "render")
-    os.makedirs(frames_path, exist_ok=True)
-    for idx, img in enumerate(imgs):
-        img_path = os.path.join(frames_path, '{0:05d}'.format(idx) + ".png")
-        Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)).save(img_path)
-    
-    # Load 
-    refine_path = os.path.join(episode_root, "render_refine")
-    refine_pipe = None
-    
-    final_imgs = []
-    if refine:
-        if use_flow_edit:
-            fe_kwargs = dict(save_path=refine_path, device="cuda:0", model_type=model_type)
-            if flux_model_path:
-                fe_kwargs["model_path"] = flux_model_path
-            refine_pipe = FlowEditRefineIDU(**fe_kwargs)
-            final_imgs = refine_pipe.run(
-                imgs,
-                n_min=flow_edit_n_min,
-                n_max=flow_edit_n_max,
-                n_max_end=flow_edit_n_max_end,
-                n_avg=flow_edit_n_avg
-            )
-        elif use_difix3d:
-            refine_pipe = Difix3DRefineIDU(
-                save_path=refine_path,
-                device="cuda:0",
-                model_name=difix3d_model,
-                use_reference=difix3d_use_reference
-            )
-            final_imgs = refine_pipe.run(
-                imgs,
-                prompt=difix3d_prompt,
-                num_inference_steps=difix3d_steps,
-                timesteps=difix3d_timesteps,
-                guidance_scale=difix3d_guidance
-            )
-        elif use_dreamscene:
-            refine_pipe = DreamSceneRefineIDU(
-                save_path=refine_path,
-                device="cuda:0",
-                model="sd21" if use_sd21 else "diffusionsat",
-            )
-            final_imgs = refine_pipe.run(
-                imgs,
-            )
-        else:
-            raise NotImplementedError("DiffusionSat refine is deprecated")
-        if refine_pipe:
-            del refine_pipe
-        torch.cuda.empty_cache()
-    else:   
-        for img in imgs:
-            # from torch tensor to PIL
-            final_imgs.append(Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)))
+    os.makedirs(episode_root, exist_ok=True)
+    if isinstance(elevation, list) or isinstance(radius, list):
+        if not options.idu_no_curriculum or not isinstance(elevation, list) or not isinstance(radius, list):
+            raise ValueError("Multiple IDU elevations/radii require idu_no_curriculum")
+        if not elevation or len(elevation) != len(radius):
+            raise ValueError("IDU elevation and radius lists must have equal nonzero length")
+        courses = list(zip(elevation, radius))
+    else:
+        courses = [(elevation, radius)]
 
+    # Keep the original extrinsic camera course, but render each pose once.
+    # Independent diffusion samples are expanded only after view-pair selection.
+    unique_infos = []
+    for ele, rad in courses:
+        for target in targets:
+            unique_infos.extend(gen_idu_orbit_camera(
+                target, ele, rad, idu_num_cams, 1, height, width, fov_x,
+            ))
+    if len(courses) > 1:
+        unique_infos = random.sample(unique_infos, len(unique_infos) // len(courses))
+    unique_infos = [
+        info._replace(uid=1000 + index, image_name=f"idu_view_{index:05d}.png")
+        for index, info in enumerate(unique_infos)
+    ]
+    if not unique_infos:
+        raise ValueError("The IDU camera course produced no views")
+
+    gaussians = GaussianModel(
+        dataset.sh_degree, dataset.appearance_enabled,
+        dataset.appearance_n_fourier_freqs, dataset.appearance_embedding_dim,
+    )
+    model_params, first_iter = torch.load(checkpoint_path, weights_only=False)
+    scene = Scene(
+        dataset, gaussians, load_iteration=first_iter, shuffle=False,
+        ply_path=os.path.dirname(checkpoint_path),
+    )
+    # Scene loads a PLY; restore the authoritative checkpoint afterwards.
+    gaussians.load_from_checkpoints(model_params)
+    generated_dataset = copy.copy(dataset)
+    generated_dataset.resolution = 1
+    views = cameraList_from_camInfos(unique_infos, 1, generated_dataset, is_idu=True)
+    gaussians.compute_3D_filter(cameras=list(scene.getTrainCameras()) + views)
+    background = torch.tensor(
+        [1, 1, 1] if dataset.white_background else [0, 0, 0],
+        dtype=torch.float32, device="cuda",
+    )
+    context_images = [
+        (camera, to_pil_image(camera.original_image.detach().cpu()))
+        for camera in scene.getTrainCameras()
+    ]
+
+    def render_view(camera):
+        package = render(
+            camera, gaussians, pipeline, background,
+            kernel_size=dataset.kernel_size, testing=True,
+        )
+        return RenderBundle(
+            rgb=package["render"], depth=package["render_depth"],
+            alpha=package["render_alpha"], camera=camera,
+        )
+
+    prepared = prepare_stage2_inputs(
+        views, context_images, render_view,
+        checkpoint_path=checkpoint_path, episode_dir=episode_root,
+        episode_idx=episode_idx, options=options,
+    )
+    del render_view, context_images, views, scene, gaussians, model_params, background
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    final_imgs = refine_stage2_inputs(prepared, options=options)
+    expected_count = len(unique_infos) * idu_num_samples_per_view
+    if len(final_imgs) != expected_count:
+        raise RuntimeError(f"Expected {expected_count} refined IDU samples, got {len(final_imgs)}")
+    if any(image.size != (width, height) for image in final_imgs):
+        raise ValueError("Stage2 refinement must preserve the IDU camera raster")
 
     depth_path = os.path.join(episode_root, "render_depth")
     os.makedirs(depth_path, exist_ok=True)
-    moge = MoGeIDU(
-        depth_path,
-        device = "cuda:0",
-        fov_x=fov_x
+    moge = MoGeIDU(depth_path, device="cuda:0", fov_x=fov_x)
+    try:
+        depths = moge.run(final_imgs)
+    finally:
+        del moge
+        gc.collect()
+        torch.cuda.empty_cache()
+    if len(depths) != expected_count:
+        raise RuntimeError("MoGe returned a different number of depths than refined IDU images")
+
+    final_idu_infos = []
+    for view_index, info in enumerate(unique_infos):
+        for sample_index in range(idu_num_samples_per_view):
+            index = view_index * idu_num_samples_per_view + sample_index
+            np.save(os.path.join(depth_path, f"{index:05d}.npy"), depths[index])
+            final_idu_infos.append(info._replace(
+                uid=1000 + index, image=final_imgs[index], depth=depths[index],
+                image_name=f"idu_view_{view_index:05d}_sample_{sample_index:02d}.png",
+                mask=None,
+            ))
+    final_cameras = cameraList_from_camInfos(
+        final_idu_infos, 1, generated_dataset, is_idu=True,
     )
-    depths = moge.run(final_imgs)
-
-
-    final_idu_cam_infos = []
-    # Save to cam_infos
-    for idx, cam_info in enumerate(idu_cam_infos):
-        final_cam_info = CameraInfo(
-            uid=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-            FovY=cam_info.FovY, FovX=cam_info.FovX, 
-            cx=0, cy=0,
-            image=final_imgs[idx], image_path=cam_info.image_path,
-            image_name=cam_info.image_name, 
-            depth=depths[idx], mask=None,
-            width=cam_info.width, height=cam_info.height
-        )
-        final_idu_cam_infos.append(final_cam_info)
-
-    final_cam_lists = cameraList_from_camInfos(final_idu_cam_infos, 1, dataset, is_idu=True, is_pseudo_cam=idu_random_ap)
-        
-    del moge
-    del gaussians
-    torch.cuda.empty_cache()
-
     meta = {
         "episode_idx": episode_idx,
         "dirname": episode_name,
-        "elevation": elevation if not isinstance(elevation, list) else list(elevation),
-        "radius": radius if not isinstance(radius, list) else list(radius),
-        "n_images": len(final_imgs),
-        "render_dir": frames_path,
-        "refine_dir": refine_path,
+        "elevation": elevation,
+        "radius": radius,
+        "n_views": len(unique_infos),
+        "samples_per_view": idu_num_samples_per_view,
+        "n_images": expected_count,
+        "render_dir": os.path.join(episode_root, "render"),
+        "refine_dir": os.path.join(episode_root, "render_refine"),
         "depth_dir": depth_path,
         "checkpoint_used": checkpoint_path,
+        "refinement_method": "gaussianzoom_dloral",
+        "refinement_inputs": prepared,
         "cameras": [
-            {
-                "index": idx,
-                "uid": int(cam.uid),
-                "image_name": cam.image_name,
-            }
-            for idx, cam in enumerate(idu_cam_infos)
+            {"index": index, "uid": info.uid, "image_name": info.image_name}
+            for index, info in enumerate(final_idu_infos)
         ],
     }
-    os.makedirs(episode_root, exist_ok=True)
-    with open(os.path.join(episode_root, "episode_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
-    write_idu_compare_html(episode_root, len(final_imgs), episode_idx, elevation, radius)
+    with open(os.path.join(episode_root, "episode_meta.json"), "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, ensure_ascii=False)
+    write_idu_compare_html(episode_root, expected_count, episode_idx, elevation, radius)
     update_idu_root_index(dataset.model_path, {
-        "episode_idx": episode_idx,
-        "dirname": episode_name,
-        "elevation": meta["elevation"],
-        "radius": meta["radius"],
-        "n_images": len(final_imgs),
+        "episode_idx": episode_idx, "dirname": episode_name,
+        "elevation": elevation, "radius": radius, "n_images": expected_count,
+        "refinement_method": "gaussianzoom_dloral",
     })
-    print(f"Saved IDU episode artifacts to {episode_root}")
-
-    return final_cam_lists
+    print(f"Saved GaussianZoom IDU episode artifacts to {episode_root}")
+    return final_cameras
 
 @torch.no_grad()
 def generate_pseudo_cams(
@@ -698,47 +662,32 @@ def training_idu_episode(
         idu_num_cams, idu_num_samples_per_view,
         episode_idx: int = 0,
     ):
-    # NOTE: generate pose -> render frame -> refined using DiffusionSat -> use MoGe to predict monocular depth
-    if opt.use_lpips_loss:
-        lpips_loss_fn = lpips.LPIPS(net=opt.lpips_net)
-        for param in lpips_loss_fn.parameters():
-            param.requires_grad = False
-        lpips_loss_fn.cuda()
-        print("Initialized LPIPS loss")
+    # Refine all extrapolated curriculum views, then optimize the full 3DGS.
     # Generate IDU training set
     if not opt.idu_no_curriculum:
         assert isinstance(elevation, float) and isinstance(radius, float)
     else:
         assert isinstance(elevation, list) and isinstance(radius, list), "Elevation and radius should be list when no_curriculum is True"
     
-    # Validate refinement method selection
-    if opt.idu_use_flow_edit and opt.idu_use_difix3d:
-        raise ValueError("Cannot use both FlowEdit and Difix3D simultaneously. Please choose one refinement method.")
-    
-    if opt.idu_refine and not opt.idu_use_flow_edit and not opt.idu_use_difix3d and not opt.idu_use_dreamscene:
-        print("Warning: Refinement is enabled but no refinement method is selected. Defaulting to FlowEdit.")
-        opt.idu_use_flow_edit = True
-
     idu_cam_list = generate_idu_training_set(
-        dataset,
-        checkpoint_path,
-        pipe,
-        targets, elevation, radius, idu_num_cams, idu_num_samples_per_view, height=opt.idu_render_size, width=opt.idu_render_size, fov_x=fov, # GES: fov_x = 20.0, satellite: 60.0
-        num_steps=opt.idu_ddim_step, strength=opt.idu_ddim_strength,
-        guidance_scale=opt.idu_ddim_guidance_scale, eta=opt.idu_ddim_eta,
-        use_flow_edit=opt.idu_use_flow_edit, flow_edit_n_min=opt.idu_flow_edit_n_min, flow_edit_n_max=opt.idu_flow_edit_n_max, flow_edit_n_max_end=opt.idu_flow_edit_n_max_end, flow_edit_n_avg=opt.idu_flow_edit_n_avg,
-        model_type=opt.idu_model_type,
-        use_difix3d=opt.idu_use_difix3d, difix3d_model=opt.idu_difix3d_model, difix3d_steps=opt.idu_difix3d_steps,
-        difix3d_guidance=opt.idu_difix3d_guidance, difix3d_timesteps=opt.idu_difix3d_timesteps, 
-        difix3d_use_reference=opt.idu_difix3d_use_reference, difix3d_prompt=opt.idu_difix3d_prompt,
-        use_dreamscene=opt.idu_use_dreamscene, use_sd21=opt.idu_use_sd21,
-        refine=opt.idu_refine, idu_no_curriculum=opt.idu_no_curriculum, idu_random_ap=opt.idu_random_ap,
-        episode_idx=episode_idx,
-        flux_model_path=getattr(opt, "flux_model_path", "") or None,
+        dataset, checkpoint_path, pipe, targets, elevation, radius,
+        idu_num_cams, idu_num_samples_per_view,
+        options=opt, height=opt.idu_render_size, width=opt.idu_render_size,
+        fov_x=fov, episode_idx=episode_idx,
     )
 
     # load Gaussians and scene
     tb_writer = prepare_output_and_logger(dataset)
+    if opt.use_lpips_loss:
+        lpips_loss_fn = lpips.LPIPS(net=opt.lpips_net)
+        for param in lpips_loss_fn.parameters():
+            param.requires_grad = False
+        lpips_loss_fn.cuda()
+        print("Initialized LPIPS loss")
+    moge_standalone = (
+        MoGeIDU(os.path.join(dataset.model_path, "depth_tmp"), "cuda:0", 60.0)
+        if opt.lambda_pseudo_depth > 0 else None
+    )
     gaussians = GaussianModel(
         dataset.sh_degree,
         dataset.appearance_enabled,
@@ -795,6 +744,9 @@ def training_idu_episode(
     ema_depth_loss_for_log = 0.0
     ema_opacity_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    episode_first_iteration = first_iter
+    episode_started = time.time()
+    episode_metrics = {}
     first_iter += 1
     testing_iterations = [iter for iter in range(first_iter, opt.iterations + 2, opt.idu_testing_interval)][1:] # skip first iter
     if opt.iterations not in testing_iterations:
@@ -870,8 +822,8 @@ def training_idu_episode(
             background, 
             kernel_size=dataset.kernel_size, 
             subpixel_offset=subpixel_offset,
-            testing=(idu_viewpoint and not opt.idu_random_ap)
-            # If running iterative datasets update, render image using mean of training embedding
+            testing=bool(idu_viewpoint)
+            # Use the same fixed IDU appearance policy as the generation pass.
         )
         image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -887,16 +839,13 @@ def training_idu_episode(
         loss = None
         if dataset.resample_gt_image:
             gt_image = create_offset_gt(gt_image, subpixel_offset)
-        if opt.idu_refine or not idu_viewpoint:
-            Ll1 = l1_loss(image, gt_image)
-            if opt.use_lpips_loss:
-                lpips_value = lpips_loss_fn(image.unsqueeze(0)*2.0-1.0,  gt_image.unsqueeze(0)*2.0-1.0).mean()
-                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * lpips_value
-            else:
-                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-                loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        Ll1 = l1_loss(image, gt_image)
+        if opt.use_lpips_loss:
+            lpips_value = lpips_loss_fn(image.unsqueeze(0)*2.0-1.0, gt_image.unsqueeze(0)*2.0-1.0).mean()
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * lpips_value
         else:
-            Ll1 = torch.tensor(0.0)
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
 
         depth_loss = 0.0
@@ -918,12 +867,9 @@ def training_idu_episode(
             # loss += lambda_depth * depth_loss
         if opt.lambda_pseudo_depth > 0 and iteration % opt.sample_pseudo_interval == 0:
             if not pseudo_stack:
-                # sample elevation from 80 to 45
-                elevation = (first_iter + opt.idu_episode_iterations - iteration) / opt.idu_episode_iterations * (85 - 45) + 45
-                # radius = (first_iter + opt.idu_episode_iterations - iteration) / opt.idu_episode_iterations * (300 - 250) + 250
-                radius = (first_iter + opt.idu_episode_iterations - iteration) / opt.idu_episode_iterations * (150 - 75) + 75  # For GES
-
-                pseudo_stack = generate_pseudo_cams(dataset, opt.num_pseudo_cams, num_train_cams, elevation, radius)
+                pseudo_elevation = (first_iter + opt.idu_episode_iterations - iteration) / opt.idu_episode_iterations * (85 - 45) + 45
+                pseudo_radius = (first_iter + opt.idu_episode_iterations - iteration) / opt.idu_episode_iterations * (150 - 75) + 75
+                pseudo_stack = generate_pseudo_cams(dataset, opt.num_pseudo_cams, num_train_cams, pseudo_elevation, pseudo_radius)
             
             pseudo_cam = pseudo_stack.pop(randint(0, len(pseudo_stack) - 1))
             render_pkg = render(
@@ -990,10 +936,12 @@ def training_idu_episode(
                 progress_bar.close()
 
             # Log and save
-            training_report(
+            report = training_report(
                 tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size),
                 iterative_datasets_update=True
             )
+            if report:
+                episode_metrics[str(iteration)] = report
 
             # Densification
             if iteration < idu_densify_until_iter:
@@ -1041,13 +989,52 @@ def training_idu_episode(
         dataset.kernel_size,
         after_dir,
     )
-                
+
+    if getattr(opt, "compact_retention", False):
+        # Panels and provenance first, then the consumed dense scratch goes away.
+        summary = finalize_episode(
+            dataset.model_path,
+            episode_dir_name=episode_name,
+            episode_idx=episode_idx,
+            elevation=elevation,
+            radius=radius,
+            iteration_start=episode_first_iteration,
+            iteration_end=opt.iterations,
+            checkpoint_path=checkpoint_path,
+            point_cloud_path=os.path.join(
+                dataset.model_path, "point_cloud", f"iteration_{opt.iterations}",
+                "point_cloud.ply"),
+            metrics=episode_metrics,
+            timings={
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(episode_started)),
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "seconds": round(time.time() - episode_started, 1),
+            },
+        )
+        print(
+            f"[compact] episode {episode_idx:02d}: retained {summary['retained_bytes'] / 1e6:.1f} MB, "
+            f"removed {summary['removed_bytes'] / 1e9:.2f} GB of consumed scratch"
+        )
+        del summary
+
     return checkpoint_path
 
 def training_idu(dataset, opt, pipe, init_checkpoint_path):
+    validate_stage2_options(opt)
+    if not init_checkpoint_path or not os.path.isfile(init_checkpoint_path):
+        raise ValueError("Stage2 requires an existing --start_checkpoint")
     start_checkpoint_path = init_checkpoint_path
     opt.opacity_reset_interval = opt.idu_opacity_reset_interval
     opt.idu_testing_interval = opt.idu_episode_iterations // 4
+    if opt.idu_testing_interval < 1:
+        raise ValueError("idu_episode_iterations must be at least 4")
+    if not 0 <= opt.idu_densify_until_iter < opt.idu_episode_iterations:
+        raise ValueError("idu_densify_until_iter must be within the episode")
+    if not 0.0 <= opt.idu_train_ratio <= 1.0:
+        raise ValueError("idu_train_ratio must be between 0 and 1")
+    random.seed(opt.idu_seed)
+    np.random.seed(opt.idu_seed)
+    torch.manual_seed(opt.idu_seed)
     opt.idu_position_lr_max_steps = opt.idu_episode_iterations
     # extract idu params
     idu_params: IDUParams = opt.idu_params[opt.datasets_type]
@@ -1069,6 +1056,32 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
     xx, yy = np.meshgrid(x, y)
     targets = np.stack([xx, yy, np.zeros_like(xx)], axis=-1).reshape(-1, 3).tolist()
     assert len(targets) == opt.idu_grid_size * opt.idu_grid_size
+
+    first_stage2_iteration = None
+
+    def retire_superseded_pair(episode_idx: int) -> None:
+        """Drop the previous episode's checkpoint/PLY once the newer pair exists.
+
+        ``first_stage2_iteration`` protects the Stage 1 pair (chkpnt30000 lives in
+        the Stage 1 directory and is never a Stage 2 artifact).
+        """
+        nonlocal first_stage2_iteration
+        if first_stage2_iteration is None:
+            first_stage2_iteration = opt.iterations
+        if not getattr(opt, "compact_retention", False) or episode_idx == 0:
+            return
+        retired = retire_prior_iteration(
+            dataset.model_path,
+            prior_iteration=opt.iterations - opt.idu_episode_iterations,
+            current_iteration=opt.iterations,
+            protected_below=first_stage2_iteration,
+        )
+        if retired["removed"]:
+            print(f"[compact] retired superseded pair {retired['removed']} "
+                  f"({retired['bytes'] / 1e9:.2f} GB)")
+        if retired["skipped"]:
+            print(f"[compact] superseded-pair retirement skipped: {retired['skipped']}")
+
     if not opt.idu_no_curriculum:
         
         for episode_idx, (radius, elevation) in enumerate(zip(opt.idu_radius_list, opt.idu_elevation_list)):
@@ -1082,6 +1095,7 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
                 idu_num_samples_per_view=opt.idu_num_samples_per_view,
                 episode_idx=episode_idx,
             )
+            retire_superseded_pair(episode_idx)
     else:
         print("===== Disable IDU curriculum learning =====")
         assert opt.idu_episode_iterations == 10000, "IDU episode iterations should be 10000"
@@ -1095,6 +1109,16 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
                 idu_num_samples_per_view=opt.idu_num_samples_per_view,
                 episode_idx=episode_idx,
             )
+            retire_superseded_pair(episode_idx)
+
+    if getattr(opt, "compact_retention", False):
+        comparison = build_stage_comparison(dataset.model_path)
+        if comparison["path"]:
+            print(f"[compact] stage comparison panel: {comparison['path']} "
+                  f"({comparison['panels']} episode panels)")
+        prune_stage_scratch(dataset.model_path)
+        print("[compact] Stage 2 retains the final checkpoint + matching PLY, cfg_args, "
+              "cameras.json, compact logs and per-episode summaries")
         
 
 
@@ -1138,7 +1162,7 @@ def colorize_depth_torch(depth_tensor, mask=None, normalize=True, cmap='Spectral
         normalize: Whether to normalize the depth values
         cmap: Matplotlib colormap name
     Returns:
-        Colored depth tensor [B, 3, H, W] or [3, H, W]
+        CPU float RGB tensor [3, H, W] for image logging.
     """
 
     # Process each item in batch
@@ -1153,6 +1177,8 @@ def colorize_depth_torch(depth_tensor, mask=None, normalize=True, cmap='Spectral
     
     # Convert to disparity (inverse depth)
     disp = 1 / depth
+    if np.isnan(disp).all():
+        return torch.zeros((3, *disp.shape), dtype=torch.float32)
     
     # Normalize disparity
     if normalize:
@@ -1169,7 +1195,31 @@ def colorize_depth_torch(depth_tensor, mask=None, normalize=True, cmap='Spectral
     colored = torch.from_numpy(colored).float() / 255.0
     colored = colored.permute(2, 0, 1)  # [H, W, 3] -> [3, H, W]
     
-    return colored.to(depth_tensor.device)
+    return colored
+
+#: Set from ``--compact_retention``.  Keeps scalar/ histogram logging but skips
+#: the raw full-resolution TensorBoard image events, which are the bulk of the
+#: event files and are explicitly not retained (do_not_archive).
+_COMPACT_RETENTION = False
+
+
+def _log_tensorboard_image(writer, tag, image, iteration):
+    """Encode the same full-resolution pixels with fast, lossless PNG compression."""
+    image = image.detach()
+    if image.dtype != torch.uint8:
+        image = image.mul(255.0).to(torch.uint8)
+    array = image.permute(1, 2, 0).contiguous().cpu().numpy()
+    with BytesIO() as buffer:
+        Image.fromarray(array).save(buffer, format="PNG", compress_level=1)
+        encoded = buffer.getvalue()
+    summary = Summary(value=[Summary.Value(
+        tag=_clean_tag(tag),
+        image=Summary.Image(height=array.shape[0], width=array.shape[1],
+                            colorspace=array.shape[2], encoded_image_string=encoded),
+    )])
+    writer._get_file_writer().add_summary(summary, iteration)
+    writer._get_comet_logger().log_image_encoded(encoded, tag, step=iteration)
+
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, iterative_datasets_update=False):
     if tb_writer:
@@ -1178,6 +1228,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
+    metrics = {}
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = [{'name': 'test', 'cameras' : scene.getTestCameras()}, 
@@ -1191,38 +1242,31 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, testing=(config['name'] == 'test'))
+                    render_pkg = renderFunc(
+                        viewpoint, scene.gaussians, *renderArgs,
+                        testing=config['name'] in ('test', 'train_idu'),
+                    )
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                    depth = render_pkg["render_depth"]
-                    gt_depth = viewpoint.original_depth.to("cuda")
-                    mask = viewpoint.original_mask.cuda()
-                    depth = mask * depth
-                    gt_depth = mask * gt_depth
-                    depth_vis = torch.nan_to_num(depth, nan=0, posinf=0, neginf=0)
-                    # Colorize depth
-                    colored_depth = colorize_depth_torch(
-                        depth_vis,
-                    )
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    colored_gt_depth = colorize_depth_torch(
-                        mask * gt_depth,
-                    )
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        tb_writer.add_images(
-                            config['name'] + f"_view_{viewpoint.image_name}/depth_colored",
-                            colored_depth[None],  # Add batch dimension
-                            global_step=iteration,
-                            dataformats='NCHW'
-                        )
+                    if tb_writer and not _COMPACT_RETENTION and (idx < 5):
+                        tag = config['name'] + f"_view_{viewpoint.image_name}"
+                        _log_tensorboard_image(tb_writer, tag + "/render", image, iteration)
+                        mask = viewpoint.original_mask.cuda()
+                        depth_vis = torch.nan_to_num(mask * render_pkg["render_depth"], nan=0, posinf=0, neginf=0)
+                        colored_depth = colorize_depth_torch(depth_vis)
+                        _log_tensorboard_image(tb_writer, tag + "/depth_colored", colored_depth, iteration)
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name), colored_gt_depth[None], global_step=iteration)
+                            gt_depth = mask * viewpoint.original_depth.to("cuda")
+                            colored_gt_depth = colorize_depth_torch(mask * gt_depth)
+                            _log_tensorboard_image(tb_writer, tag + "/ground_truth", gt_image, iteration)
+                            _log_tensorboard_image(tb_writer, tag + "/depth", colored_gt_depth, iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])       
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                metrics[config['name']] = {"psnr": psnr_test.item(), "l1": l1_test.item(),
+                                           "cameras": len(config['cameras'])}
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -1230,7 +1274,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        metrics["total_points"] = int(scene.gaussians.get_xyz.shape[0])
         torch.cuda.empty_cache()
+    return metrics
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -1250,6 +1296,7 @@ if __name__ == "__main__":
     parser.add_argument("--iterative_datasets_update", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    _COMPACT_RETENTION = bool(getattr(args, "compact_retention", False))
     
     print("Optimizing " + args.model_path)
 
@@ -1261,6 +1308,10 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     if not args.iterative_datasets_update:
         training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+        if args.compact_retention:
+            scratch = prune_stage_scratch(args.model_path)
+            print(f"[compact] Stage 1 keeps the final checkpoint + matching PLY; removed "
+                  f"{scratch['bytes'] / 1e9:.2f} GB of consumed scratch")
     else:
     # Start running iterative datasets update
         training_idu(lp.extract(args), op.extract(args), pp.extract(args), args.start_checkpoint)

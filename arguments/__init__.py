@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Dict
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 @dataclass
 class IDUParams:
@@ -196,23 +198,20 @@ class OptimizationParams(ParamGroup):
         
         # IDU (Iterative Dataset Update) parameters
         self._init_idu_params()
-        
-        # DDIM inversion parameters
-        self._init_ddim_params()
-        
-        # FlowEdit parameters
-        self._init_flowedit_params()
-        
-        # Difix3D parameters
-        self._init_difix3d_params()
-        
-        # DreamScene parameters
-        self.idu_use_dreamscene: bool = False
-        self.idu_use_sd21: bool = True
-        
+
+        # GaussianZoom Stage 2 synthesis parameters
+        self._init_gaussianzoom_params()
+
         # Post-training
         self.post_training_iterations: int = 500
-        
+
+        # Compact retention: keep bounded per-episode provenance (metrics, prompts,
+        # cameras) and representative comparison panels, and remove the consumed
+        # per-episode dense scratch once an episode is complete.  The final
+        # checkpoint + matching PLY pair (and the default full-artifact behaviour
+        # when this flag is off) are unaffected.
+        self.compact_retention: bool = False
+
         super().__init__(parser, "Optimization Parameters")
     
     def _init_idu_params(self):
@@ -225,13 +224,11 @@ class OptimizationParams(ParamGroup):
         self.idu_opacity_cooling_iterations: int = 1000
         self.idu_testing_interval: int = 5000  # idu_episode_iterations // 2
         
-        # IDU refinement
-        self.idu_refine: bool = False
-        self.idu_random_ap: bool = False
-        self.idu_iter_full_train: int = 0
+        # IDU camera grid
         self.idu_num_cams: int = 12
         self.idu_num_samples_per_view: int = 4
         self.idu_train_ratio: float = 0.5
+        self.idu_iter_full_train: int = 0
         
         # Dataset configuration
         self.datasets_type: str = "jax_v1"
@@ -248,41 +245,54 @@ class OptimizationParams(ParamGroup):
             )
         }
         
-        # IDU rendering
+        # IDU rendering and generated-camera raster size
         self.idu_position_lr_max_steps: int = self.idu_episode_iterations
         self.idu_render_size: int = 1024
-        
+
         # Look-at point grid
         self.idu_grid_width: int = 256
         self.idu_grid_height: int = 256
         self.idu_grid_size: int = 2
     
-    def _init_ddim_params(self):
-        """Initialize DDIM inversion parameters."""
-        self.idu_ddim_strength: float = 0.2
-        self.idu_ddim_eta: float = 0.5
-        self.idu_ddim_step: int = 50
-        self.idu_ddim_guidance_scale: float = 3.5
-    
-    def _init_flowedit_params(self):
-        """Initialize FlowEdit parameters."""
-        self.idu_use_flow_edit: bool = False
-        self.idu_flow_edit_n_min: int = 0
-        self.idu_flow_edit_n_max: int = 15
-        self.idu_flow_edit_n_max_end: int = -1  # -1 means not using sampling
-        self.idu_flow_edit_n_avg: int = 1
+    def _init_gaussianzoom_params(self):
+        """Initialize GaussianZoom Stage 2 synthesis parameters.
+
+        These configure refinement/stage2_gaussianzoom.py: per-view Qwen3-VL
+        prompts plus geometry-guided DLoRAL refinement of novel low-elevation
+        orbit views, before the original IDU training episodes run.
+        """
+        weight_root = Path(os.environ.get("DLORAL_WEIGHT_ROOT", str(_REPO_ROOT / "weights" / "dloral")))
+
+        # Per-view prompt generation, run in an isolated VLM environment.
+        self.idu_vlm_model_path: str = os.environ.get(
+            "VLM_MODEL_PATH", str(_REPO_ROOT / "weights" / "Qwen3-VL-4B-Instruct"))
+        self.idu_vlm_python: str = os.environ.get("VLM_PYTHON", sys.executable)
+        self.idu_vlm_max_new_tokens: int = 768
+        self.idu_vlm_max_image_size: int = 1024
+
+        # Geometry-guided DLoRAL refinement, run in an isolated DLoRAL environment.
+        self.idu_dloral_python: str = os.environ.get("DLORAL_PYTHON", sys.executable)
+        self.idu_dloral_root: str = str(_REPO_ROOT / "submodules" / "DLoRAL")
+        self.idu_dloral_sd_path: str = str(weight_root / "stable-diffusion-2-1-base")
+        self.idu_dloral_ckpt: str = str(weight_root / "model_enhanced.pkl")
+        self.idu_dloral_spynet: str = str(weight_root / "spynet_20210409-c6c1bd09.pth")
+        self.idu_dloral_vae_encoder_tiled_size: int = 1024
+        self.idu_dloral_latent_tiled_size: int = 96
+        self.idu_dloral_latent_tiled_overlap: int = 32
+
+        # Multi-view geometry gating and deterministic sampling.
+        self.idu_refine_device: str = "cuda:0"
+        self.idu_neighbor_pool_size: int = 8
+        self.idu_min_reprojection_coverage: float = 0.05
+        self.idu_alpha_threshold: float = 0.05
+        self.idu_depth_abs_tolerance: float = 0.05
+        self.idu_depth_rel_tolerance: float = 0.02
+        self.idu_seed: int = 0
+
+        # Retained for the standalone zoom entries (train_zoom_gen.py,
+        # train_zoom_mvp.py); the GaussianZoom Stage 2 path does not use them.
         self.idu_model_type: str = "FLUX"
         self.flux_model_path: str = ""
-    
-    def _init_difix3d_params(self):
-        """Initialize Difix3D parameters."""
-        self.idu_use_difix3d: bool = False
-        self.idu_difix3d_model: str = "nvidia/difix"
-        self.idu_difix3d_steps: int = 1
-        self.idu_difix3d_guidance: float = 0.0
-        self.idu_difix3d_timesteps: List[int] = [199]
-        self.idu_difix3d_use_reference: bool = False
-        self.idu_difix3d_prompt: str = "remove degradation"
 
 
 def get_combined_args(parser: ArgumentParser) -> Namespace:

@@ -1,9 +1,18 @@
 import os
+import shlex
+from pathlib import Path
 import GPUtil
 from concurrent.futures import ThreadPoolExecutor
 import time
 import subprocess
 import datetime
+
+# Interpreters and weights for the isolated Stage 2 synthesize/refine environments.
+SKYFALL_PYTHON = os.environ.get("SKYFALL_PYTHON", "python")
+VLM_PYTHON = os.environ.get("VLM_PYTHON", str(Path.home() / "miniconda3/envs/fixanything/bin/python3.10"))
+VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", "./weights/Qwen3-VL-4B-Instruct")
+DLORAL_PYTHON = os.environ.get("DLORAL_PYTHON", str(Path.home() / "miniconda3/envs/dloral/bin/python"))
+DLORAL_WEIGHT_ROOT = os.environ.get("DLORAL_WEIGHT_ROOT", "./weights/dloral")
 
 # Fixed scene
 # SCENE = "JAX_068"
@@ -90,8 +99,15 @@ def run_job(gpu, model_path, command_params):
     scene = model_path
     start_checkpoint = f"./outputs/NYC/{scene}/chkpnt30000.pth"
 
-    # Base command with environment variables and Python script
-    base_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train.py"
+    # Base command with environment variables and Python script. The isolated
+    # VLM/DLoRAL environments are selected by env vars, so the in-process
+    # defaults in arguments/__init__.py pick them up.
+    base_cmd = (
+        f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} "
+        f"VLM_PYTHON={shlex.quote(VLM_PYTHON)} VLM_MODEL_PATH={shlex.quote(VLM_MODEL_PATH)} "
+        f"DLORAL_PYTHON={shlex.quote(DLORAL_PYTHON)} DLORAL_WEIGHT_ROOT={shlex.quote(DLORAL_WEIGHT_ROOT)} "
+        f"{shlex.quote(SKYFALL_PYTHON)} train.py"
+    )
 
     # Define base arguments as a list for easy commenting and modification
     base_args = [
@@ -111,23 +127,8 @@ def run_job(gpu, model_path, command_params):
         if not success:
             with open(log_file, 'a') as f:
                 f.write("\n=== WARNING: Training command failed! ===\n")
+            raise RuntimeError(f"GaussianZoom Stage2 failed for {scene}; see {log_file}")
 
-    # You can uncomment these if needed in the future
-    
-    # # Rendering command
-    # render_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py -m {output_dir}/{model_path} --load_from_checkpoints"
-    # if not dry_run and not fused_only:
-    #     run_command(render_cmd, log_file, append=True)
-        
-    # # Metrics command
-    # metrics_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python metrics.py -m {output_dir}/{model_path} --resolution 1"
-    # if not dry_run and not fused_only:
-    #     run_command(metrics_cmd, log_file, append=True)
-
-    # # Create fused ply command
-    # ply_cmd = f"python create_fused_ply.py -m {output_dir}/{model_path} --output_ply fused/{model_path}_toned_iter_30000.ply --load_from_checkpoints --iteration 30000"
-    # if not dry_run:
-    #     run_command(ply_cmd, log_file, append=True)
     
     # Log job completion
     with open(log_file, 'a') as f:
@@ -173,6 +174,7 @@ def dispatch_jobs(jobs, executor):
             gpu = job_info[0]
             job = job_info[1]
             reserved_gpus.discard(gpu)  # Release this GPU
+            future.result()
             print(f"Job with model_path {job[0]} has finished, releasing GPU {gpu}")
         
         # Small delay to prevent CPU spinning
@@ -195,20 +197,13 @@ def main():
                 "--opacity_reset_interval 10000000",
                 "--iterative_datasets_update",
                 "--idu_opacity_reset_interval 5000",
-                "--idu_refine",
                 "--idu_num_samples_per_view 2",
                 "--densify_grad_threshold 0.0002",
                 "--idu_num_cams 6",
-                "--idu_use_flow_edit",
-                "--idu_render_size 1024",
-                "--idu_flow_edit_n_min 4",
-                "--idu_flow_edit_n_max 10",
-                "--idu_flow_edit_n_max_end 10",
                 "--idu_grid_size 4",
                 "--idu_grid_width 512",
                 "--idu_grid_height 512",
                 "--idu_episode_iterations 10000",
-                "--idu_iter_full_train 0",
                 "--idu_opacity_cooling_iterations 500",
                 "--lambda_pseudo_depth 0.0",
                 "--idu_densify_until_iter 9000",
@@ -228,20 +223,13 @@ def main():
                 "--opacity_reset_interval 10000000",
                 "--iterative_datasets_update",
                 "--idu_opacity_reset_interval 5000",
-                "--idu_refine",
                 "--idu_num_samples_per_view 2",
                 "--densify_grad_threshold 0.0002",
                 "--idu_num_cams 6",
-                "--idu_use_flow_edit",
-                "--idu_render_size 1024",
-                "--idu_flow_edit_n_min 4",
-                "--idu_flow_edit_n_max 10",
-                "--idu_flow_edit_n_max_end 10",
                 "--idu_grid_size 4",
                 "--idu_grid_width 512",
                 "--idu_grid_height 512",
                 "--idu_episode_iterations 10000",
-                "--idu_iter_full_train 0",
                 "--idu_opacity_cooling_iterations 500",
                 "--lambda_pseudo_depth 0.0",
                 "--idu_densify_until_iter 9000",
@@ -261,20 +249,13 @@ def main():
                 "--opacity_reset_interval 10000000",
                 "--iterative_datasets_update",
                 "--idu_opacity_reset_interval 5000",
-                "--idu_refine",
                 "--idu_num_samples_per_view 2",
                 "--densify_grad_threshold 0.0002",
                 "--idu_num_cams 6",
-                "--idu_use_flow_edit",
-                "--idu_render_size 1024",
-                "--idu_flow_edit_n_min 4",
-                "--idu_flow_edit_n_max 10",
-                "--idu_flow_edit_n_max_end 10",
                 "--idu_grid_size 4",
                 "--idu_grid_width 512",
                 "--idu_grid_height 512",
                 "--idu_episode_iterations 10000",
-                "--idu_iter_full_train 0",
                 "--idu_opacity_cooling_iterations 500",
                 "--lambda_pseudo_depth 0.0",
                 "--idu_densify_until_iter 9000",
@@ -294,20 +275,13 @@ def main():
                 "--opacity_reset_interval 10000000",
                 "--iterative_datasets_update",
                 "--idu_opacity_reset_interval 5000",
-                "--idu_refine",
                 "--idu_num_samples_per_view 2",
                 "--densify_grad_threshold 0.0002",
                 "--idu_num_cams 6",
-                "--idu_use_flow_edit",
-                "--idu_render_size 1024",
-                "--idu_flow_edit_n_min 4",
-                "--idu_flow_edit_n_max 10",
-                "--idu_flow_edit_n_max_end 10",
                 "--idu_grid_size 4",
                 "--idu_grid_width 512",
                 "--idu_grid_height 512",
                 "--idu_episode_iterations 10000",
-                "--idu_iter_full_train 0",
                 "--idu_opacity_cooling_iterations 500",
                 "--lambda_pseudo_depth 0.0",
                 "--idu_densify_until_iter 9000",

@@ -327,8 +327,8 @@ def roundtrip_diagnostics(
     forward_valid: torch.Tensor,
     reverse_hw2: torch.Tensor,
     reverse_valid: torch.Tensor,
-) -> dict[str, float]:
-    """Compose target→source→target using two independently computed fields."""
+) -> dict[str, float | int | None]:
+    """Compose independent fields; missing roundtrip errors are JSON null, not zero."""
 
     error, hit = roundtrip_error_map(forward_hw2, forward_valid, reverse_hw2, reverse_valid)
     count = int(hit.sum().item())
@@ -337,8 +337,8 @@ def roundtrip_diagnostics(
             "forward_coverage": float(forward_valid.float().mean().item()),
             "reverse_coverage": float(reverse_valid.float().mean().item()),
             "roundtrip_hit_rate": 0.0,
-            "median_roundtrip_error_px": float("nan"),
-            "mean_roundtrip_error_px": float("nan"),
+            "median_roundtrip_error_px": None,
+            "mean_roundtrip_error_px": None,
             "hit_pixels": 0,
         }
     return {

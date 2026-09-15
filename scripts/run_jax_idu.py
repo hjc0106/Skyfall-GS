@@ -1,9 +1,19 @@
 # single-scale training and multi-scale testing setting proposed in mip-splatting
 import os
+from pathlib import Path
+import shlex
+import subprocess
 import GPUtil
 from concurrent.futures import ThreadPoolExecutor
 import queue
 import time
+
+# Interpreters and weights for the isolated Stage 2 synthesize/refine environments.
+SKYFALL_PYTHON = os.environ.get("SKYFALL_PYTHON", "python")
+VLM_PYTHON = os.environ.get("VLM_PYTHON", str(Path.home() / "miniconda3/envs/fixanything/bin/python3.10"))
+VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", "./weights/Qwen3-VL-4B-Instruct")
+DLORAL_PYTHON = os.environ.get("DLORAL_PYTHON", str(Path.home() / "miniconda3/envs/dloral/bin/python"))
+DLORAL_WEIGHT_ROOT = os.environ.get("DLORAL_WEIGHT_ROOT", "./weights/dloral")
 
 scenes = ["JAX_004", "JAX_068", "JAX_214", "JAX_260"]
 
@@ -22,8 +32,15 @@ fused_only = False
 jobs = list(zip(scenes, factors))
 
 def train_scene(gpu, scene, factor):
-    # Base command with environment variables and Python script
-    base_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train.py"
+    # Base command with environment variables and Python script. The isolated
+    # VLM/DLoRAL environments are selected by env vars, so the in-process
+    # defaults in arguments/__init__.py pick them up.
+    base_cmd = (
+        f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} "
+        f"VLM_PYTHON={shlex.quote(VLM_PYTHON)} VLM_MODEL_PATH={shlex.quote(VLM_MODEL_PATH)} "
+        f"DLORAL_PYTHON={shlex.quote(DLORAL_PYTHON)} DLORAL_WEIGHT_ROOT={shlex.quote(DLORAL_WEIGHT_ROOT)} "
+        f"{shlex.quote(SKYFALL_PYTHON)} train.py"
+    )
     
     # Define arguments as a list for easy commenting and modification
     args = [
@@ -41,21 +58,14 @@ def train_scene(gpu, scene, factor):
         "--lambda_opacity 0.0",
         "--opacity_reset_interval 10000000",
         "--idu_opacity_reset_interval 5000",
-        "--idu_refine",
         "--idu_num_samples_per_view 2",
         "--densify_grad_threshold 0.0002",
         "--datasets_type jax_v1",
         "--idu_num_cams 6",
-        "--idu_use_flow_edit",
-        "--idu_render_size 1024",
-        "--idu_flow_edit_n_min 4",
-        "--idu_flow_edit_n_max 10",
-        "--idu_flow_edit_n_max_end 10",
         "--idu_grid_size 3",
         "--idu_grid_width 512",
         "--idu_grid_height 512",
         "--idu_episode_iterations 10000",
-        "--idu_iter_full_train 0",
         "--idu_opacity_cooling_iterations 500",
         "--lambda_pseudo_depth 0.5",
         "--idu_densify_until_iter 9000",
@@ -76,45 +86,26 @@ def train_scene(gpu, scene, factor):
     if not dry_run and train and not fused_only:
         # Create output directory if it doesn't exist
         os.makedirs(f"{output_dir}/{scene}", exist_ok=True)
-        os.system(cmd_with_tee)
+        subprocess.run(["bash", "-o", "pipefail", "-c", cmd_with_tee], check=True)
 
-    # Render command
-    render_base_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py"
-    render_args = [
-        f"-m {output_dir}/{scene}",
-        "--load_from_checkpoints",
-        # Add more render args here if needed
-    ]
-    cmd = render_base_cmd + " " + " ".join(render_args)
-    print(cmd)
-    if not dry_run and not fused_only:
-        os.system(cmd)
-        
-    # Metrics command
-    metrics_base_cmd = f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python metrics.py"
-    metrics_args = [
-        f"-m {output_dir}/{scene}",
-        "--resolution 1",
-        # Add more metrics args here if needed
-    ]
-    cmd = metrics_base_cmd + " " + " ".join(metrics_args)
-    print(cmd)
-    if not dry_run and not fused_only:
-        os.system(cmd)
 
     # Create fused ply command
-    fused_base_cmd = f"python create_fused_ply.py"
-    fused_args = [
-        f"-m {output_dir}/{scene}",
-        f"--output_ply fused/{scene}_depth_toned_iter_20000.ply",
-        "--load_from_checkpoints",
-        "--iteration 30000",
-        # Add more fused ply args here if needed
+    checkpoints = sorted(
+        Path(output_dir, scene).glob("chkpnt*.pth"),
+        key=lambda path: int(path.stem.removeprefix("chkpnt")),
+    )
+    if not dry_run and not checkpoints:
+        raise FileNotFoundError(f"No Stage2 checkpoint in {output_dir}/{scene}")
+    iteration = int(checkpoints[-1].stem.removeprefix("chkpnt")) if checkpoints else 80000
+    cmd = [
+        SKYFALL_PYTHON, "create_fused_ply.py", "-m", f"{output_dir}/{scene}",
+        "--output_ply", f"fused/{scene}_gaussianzoom_iter_{iteration}.ply",
+        "--load_from_checkpoints", "--iteration", str(iteration),
     ]
-    cmd = fused_base_cmd + " " + " ".join(fused_args)
-    print(cmd)
+    print(shlex.join(cmd))
     if not dry_run:
-        os.system(cmd)
+        Path("fused").mkdir(exist_ok=True)
+        subprocess.run(cmd, env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}, check=True)
     
     return True
         
@@ -151,6 +142,7 @@ def dispatch_jobs(jobs, executor):
             job = future_to_job.pop(future)  # Remove the job associated with the completed future
             gpu = job[0]  # The GPU is the first element in each job tuple
             reserved_gpus.discard(gpu)  # Release this GPU
+            future.result()
             print(f"Job {job} has finished., rellasing GPU {gpu}")
         # (Optional) You might want to introduce a small delay here to prevent this loop from spinning very fast
         # when there are no GPUs available.

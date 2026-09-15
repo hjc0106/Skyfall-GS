@@ -1,0 +1,91 @@
+{
+  "_documentation": {
+    "purpose": "Structural EXAMPLE of the shared <archive-root>/pipeline_manifest.json consumed by scripts/train_full_dataset.py plan --manifest (cross-check only), scripts/archive_dataset_results.py (requires this file at <archive-root>/pipeline_manifest.json), and scripts/evaluate_dataset.py / scripts/run_eval_queue.sh (--manifest / EVAL_MANIFEST).",
+    "how_to_use": "Copy this file to your deployment archive root as pipeline_manifest.json and replace every value marked below as user-editable. Do NOT rename the contract keys; the workers read them verbatim.",
+    "user_editable_paths": [
+      "local_project: absolute path of this repository checkout",
+      "local_python: python interpreter of the local evaluation environment (scripts/run_eval_queue.sh default is env var EVAL_PYTHON)",
+      "archive_root: local directory holding <scene>/<stage>/ archives, evaluation/ results, and this pipeline_manifest.json",
+      "local_dataset_root: local copy of datasets_JAX/ and datasets_NYC/",
+      "local_eval_archive_root: local directory for official eval data (results_eval)",
+      "remote_host / remote_read_host: SSH CONFIG ALIASES defined in ~/.ssh/config. They are names, not hostnames; no credentials belong in this file. archive_dataset_results.py --host defaults to remote_host.",
+      "remote_project / remote_run_root / remote_control_root / remote_activation: absolute paths inside the remote training host"
+    ],
+    "scenes": "Keep the 12-scene list and order; scripts/train_full_dataset.py plan --manifest cross-checks it against the embedded table. The training runner's authoritative scene table and reuse paths are EMBEDDED in scripts/train_full_dataset.py (SCENES), not derived from this manifest. The archive worker DOES consume the manifest reuse_stage1/reuse_stage2 values as source/provenance paths; customize them to the same verified remote snapshots configured in the training runner.",
+    "recipe_decisions_that_are_not_defaults_to_change_casually": [
+      "JAX uses the 3x3 IDU grid (jax_v1); NYC keeps its 4x4 grid and scene-family loss settings (nyc_v1).",
+      "Stage 1 runs 30000 iterations; Stage 2 runs five 10000-iteration episodes; final_iteration is 80000.",
+      "Retention requires BOTH the final checkpoint (learned appearance embeddings/MLP) AND the matching point_cloud PLY (filter_3D); neither alone is a faithful model."
+    ],
+    "not_turnkey": "Copying this example does NOT by itself make a fresh deployment turnkey: scripts/train_full_dataset.py is a frozen experiment queue whose scene table, recipes and root defaults target the 2026-09-13 experiment. Set roots via GZ_RUN_ROOT/GZ_CONTROL_ROOT/GZ_ARCHIVE_ROOT or CLI overrides, cross-check with plan --manifest, and reconfigure embedded reuse paths before run. The run subcommand does not accept --manifest.",
+    "outputs": "Training publishes <remote_run_root>/<scene>/<stage>/stage_complete.json. Archiving publishes <archive_root>/<scene>/<stage>/archive_status.json (status=verified). Evaluation publishes <archive_root>/<scene>/evaluation/<stage>/evaluation_status.json (model_load_verified=true, then completed). Remote cleanup is gated on the verified archive AND the model-load-confirmed evaluation."
+  },
+  "schema_version": 1,
+  "method": "gaussianzoom_stage2",
+  "branch": "dev-stage2-gaussianzoom",
+  "local_project": "/absolute/path/to/Skyfall-GS",
+  "local_python": "/absolute/path/to/conda/envs/skyfall/bin/python",
+  "archive_root": "/absolute/path/to/experiments/stage2_gaussianzoom",
+  "local_dataset_root": "/absolute/path/to/dataset",
+  "local_eval_archive_root": "/absolute/path/to/eval_data",
+  "remote_host": "YOUR-SSH-ALIAS-REMOTE-TRAIN",
+  "remote_read_host": "YOUR-SSH-ALIAS-REMOTE-READ",
+  "remote_project": "/remote/absolute/path/Skyfall-GS",
+  "remote_run_root": "/remote/absolute/path/skyfall-gs_exp/full_dataset_gz",
+  "remote_control_root": "/remote/absolute/path/skyfall-setup/full-dataset",
+  "remote_activation": "/remote/absolute/path/skyfall-setup/activate.sh",
+  "scenes": [
+    {"scene": "JAX_004", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_068", "dataset": "datasets_JAX", "recipe": "jax_v1", "reuse_stage1": "/remote/absolute/path/of/optional/verified/stage1", "reuse_stage2": "/remote/absolute/path/of/optional/verified/stage2"},
+    {"scene": "JAX_164", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_168", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_175", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_214", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_260", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "JAX_264", "dataset": "datasets_JAX", "recipe": "jax_v1"},
+    {"scene": "NYC_004", "dataset": "datasets_NYC", "recipe": "nyc_v1"},
+    {"scene": "NYC_010", "dataset": "datasets_NYC", "recipe": "nyc_v1"},
+    {"scene": "NYC_219", "dataset": "datasets_NYC", "recipe": "nyc_v1"},
+    {"scene": "NYC_336", "dataset": "datasets_NYC", "recipe": "nyc_v1"}
+  ],
+  "training": {
+    "stage1_iterations": 30000,
+    "stage2_episode_iterations": 10000,
+    "stage2_episodes": 5,
+    "final_iteration": 80000,
+    "seed": 0,
+    "cpu_threads": 8,
+    "gpu_owner": "DatasetTrainer",
+    "retain_only_latest_remote_checkpoint_during_stage2": true,
+    "compact_completed_episode_artifacts": true,
+    "preserve_optimization_and_sampling_recipe": true
+  },
+  "retention": {
+    "keep_each_stage": ["final checkpoint", "matching final point_cloud PLY (filter_3D)", "cfg_args", "cameras.json", "run arguments and provenance", "metrics", "compact logs", "representative visual comparisons"],
+    "do_not_archive": ["intermediate checkpoints/PLY", "geometry flow/depth/alpha scratch", "DLoRAL diagnostic tensors", "generation cache", "temporary MoGe data", "redundant generated samples", "raw TensorBoard image events"],
+    "model_archive_reason": "The checkpoint contains learned per-Gaussian appearance embeddings and MLP; filter_3D is stored in the matching PLY, not capture(). Both are required for faithful evaluation with the existing model format.",
+    "delete_remote_only_after": ["selected file manifest frozen", "local SHA256 verification", "local model/evaluation load confirmation"],
+    "leave_data_and_weights_remote": true
+  },
+  "stage_publish_contract": {
+    "remote_marker": "<remote_run_root>/<scene>/<stage>/stage_complete.json",
+    "required_fields": ["schema_version", "status", "scene", "stage", "iteration", "output_dir", "checkpoint", "point_cloud", "source_path"],
+    "status_value": "completed",
+    "local_archive_dir": "<archive_root>/<scene>/<stage>",
+    "local_archive_marker": "archive_status.json",
+    "archive_ready_status": "verified",
+    "evaluation_output_dir": "<archive_root>/<scene>/evaluation/<stage>",
+    "evaluation_marker": "evaluation_status.json",
+    "evaluation_complete_status": "completed",
+    "ready_marker_rule": "Atomically publish completion markers last; no other worker edits another worker's status file."
+  },
+  "evaluation": {
+    "gpu_owner": "DatasetEvaluator (local GPU only)",
+    "primary": "All held-out satellite views, identical cameras and pixel-domain PSNR/SSIM/LPIPS for Stage1 and Stage2",
+    "visual": "Fixed checked-in camera trajectories, Stage1 versus Stage2 videos and comparison grids",
+    "official_gt_initial_coverage": ["JAX_004", "JAX_068", "JAX_214", "JAX_260", "NYC_004", "NYC_010", "NYC_219", "NYC_336"],
+    "official_gt_rule": "Verify current official availability and pose/frame correspondence. Never label unaligned frames as paired PSNR/SSIM/LPIPS ground truth. Report missing GT explicitly; do not omit any of the 12 training scenes.",
+    "perceptual_distribution_metrics": ["CLIP-FID", "CMMD"],
+    "gpu_batch_policy": "Sequential model loading and one-frame rendering on 24GB local GPU; no training optimizer GPU allocation."
+  }
+}

@@ -26,8 +26,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from PIL import Image
 
@@ -194,6 +195,7 @@ class DLoRALBackend(Refiner):
             None if max_roundtrip_error_px is None else float(max_roundtrip_error_px)
         )
         self.dump_spatial_features = bool(dump_spatial_features)
+        self._worker_session = None
         if self.upscale < 1:
             raise ValueError("dloral upscale must be >= 1")
         interpreter = shutil.which(self.python) or self.python
@@ -235,6 +237,46 @@ class DLoRALBackend(Refiner):
             "output_frame": "target",
             "propagation": self._propagation_name(),
         }
+
+    def _worker_env(self) -> dict[str, str]:
+        """Environment for the isolated worker, shared by one-shot and session runs."""
+
+        env = os.environ.copy()
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        env["HF_HUB_OFFLINE"] = "1"
+        env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        project_root = str(Path(__file__).resolve().parents[1])
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            project_root if not existing_pythonpath else project_root + os.pathsep + existing_pythonpath
+        )
+        return env
+
+    @contextmanager
+    def session(self) -> Iterator["DLoRALBackend"]:
+        """Reuse one worker process, and one loaded DLoRAL model, per ``refine`` block.
+
+        The worker is launched lazily on the first ``refine`` and torn down when
+        the block exits, so the model is freed before the next refinement stage.
+        Outside the block every ``refine`` keeps spawning the standalone
+        one-shot worker, so existing single-call behavior is unchanged.
+        """
+
+        from .worker_session import WorkerSession
+
+        worker = Path(__file__).with_name("dloral_worker.py")
+        project_root = Path(__file__).resolve().parents[1]
+        session = WorkerSession(
+            [self.python, str(worker), "--serve"],
+            env=self._worker_env(),
+            cwd=str(project_root),
+        )
+        with session:
+            self._worker_session = session
+            try:
+                yield self
+            finally:
+                self._worker_session = None
 
     def refine(self, request: RefinementRequest) -> RefinementResult:
         neighbor = _neighbor_from_request(request)
@@ -284,8 +326,8 @@ class DLoRALBackend(Refiner):
         started = time.perf_counter()
         with tempfile.TemporaryDirectory(prefix="dloral-") as directory:
             root = Path(directory)
-            target.save(root / "target.png")
-            neighbor_image.save(root / "neighbor.png")
+            target.save(root / "target.png", compress_level=1)
+            neighbor_image.save(root / "neighbor.png", compress_level=1)
             payload = {
                 "repo_root": self.assets["repo_root"],
                 "sd_path": self.assets["sd_path"],
@@ -325,37 +367,33 @@ class DLoRALBackend(Refiner):
             (root / "request.json").write_text(json.dumps(payload), encoding="utf-8")
             worker = Path(__file__).with_name("dloral_worker.py")
             project_root = Path(__file__).resolve().parents[1]
-            env = os.environ.copy()
-            env["TRANSFORMERS_OFFLINE"] = "1"
-            env["HF_HUB_OFFLINE"] = "1"
-            env["HF_HUB_DISABLE_TELEMETRY"] = "1"
-            existing_pythonpath = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = (
-                str(project_root)
-                if not existing_pythonpath
-                else str(project_root) + os.pathsep + existing_pythonpath
-            )
-            try:
-                import torch
+            if self._worker_session is None:
+                env = self._worker_env()
+                try:
+                    import torch
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            completed = subprocess.run(
-                [self.python, str(worker), str(root)],
-                check=False,
-                env=env,
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    "DLoRAL worker failed.\n"
-                    f"stdout:\n{completed.stdout[-4000:]}\n"
-                    f"stderr:\n{completed.stderr[-4000:]}"
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                completed = subprocess.run(
+                    [self.python, str(worker), str(root)],
+                    check=False,
+                    env=env,
+                    cwd=str(project_root),
+                    capture_output=True,
+                    text=True,
                 )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        "DLoRAL worker failed.\n"
+                        f"stdout:\n{completed.stdout[-4000:]}\n"
+                        f"stderr:\n{completed.stderr[-4000:]}"
+                    )
+            else:
+                # The long-lived worker reports failures through WorkerSession,
+                # including the diagnostic tail of its stderr log.
+                self._worker_session.run(root)
             result_path = root / "result.json"
             image_path = root / "result.png"
             if not result_path.is_file() or not image_path.is_file():
@@ -412,7 +450,18 @@ class DLoRALBackend(Refiner):
             "requested_size": list(requested),
             "elapsed_sec": elapsed,
             "worker_elapsed_sec": info.get("elapsed_sec"),
+            "worker_gpu_elapsed_sec": info.get("gpu_elapsed_sec"),
+            "worker_preprocess_sec": info.get("preprocess_sec"),
+            "worker_total_sec": info.get("total_sec"),
+            "worker_init_sec": info.get("init_elapsed_sec"),
+            "worker_request_index": info.get("request_index"),
+            "worker_session": self._worker_session is not None,
+            "seed": info.get("seed"),
+            "seed_source": info.get("seed_source"),
+            "init_cuda_rng_consumed": info.get("init_cuda_rng_consumed"),
+            "init_cpu_rng_consumed": info.get("init_cpu_rng_consumed"),
             "peak_cuda_memory_bytes": info.get("peak_cuda_memory_bytes"),
+            "init_peak_cuda_memory_bytes": info.get("init_peak_cuda_memory_bytes"),
             "geometry_coverage": None if geometry_info is None else geometry_info["coverage"],
             "reverse_source": None if geometry_info is None else geometry_info.get("reverse_source"),
             "roundtrip": None if geometry_info is None else geometry_info.get("roundtrip"),

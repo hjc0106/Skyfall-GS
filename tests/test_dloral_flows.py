@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import unittest
 
@@ -156,6 +157,18 @@ class DLoRALFlowAdapterTests(unittest.TestCase):
         full[..., 0] = 2.0
         payload = pixel_flow_to_external_flows(full, image_size=(8, 8), process_size=8, upscale=1)
         self.assertEqual(payload["reverse_source"], "scatter_invert_diagnostic_only")
+
+    def test_roundtrip_without_shared_support_has_json_safe_missing_errors(self) -> None:
+        flow = torch.zeros(4, 4, 2)
+        forward_valid = torch.ones(4, 4, dtype=torch.bool)
+        reverse_valid = torch.zeros(4, 4, dtype=torch.bool)
+        stats = roundtrip_diagnostics(flow, forward_valid, flow, reverse_valid)
+        persisted = json.loads(json.dumps(stats, allow_nan=False))
+        self.assertEqual(persisted["forward_coverage"], 1.0)
+        self.assertEqual(persisted["reverse_coverage"], 0.0)
+        self.assertEqual(persisted["hit_pixels"], 0)
+        self.assertIsNone(persisted["median_roundtrip_error_px"])
+        self.assertIsNone(persisted["mean_roundtrip_error_px"])
 
     def test_known_translation_flow_and_roundtrip(self) -> None:
         depth_value = 10.0
