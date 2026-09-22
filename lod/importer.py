@@ -14,7 +14,7 @@ from typing import Any, Sequence
 import torch
 import torch.nn as nn
 
-from .camera import skyfall_camera_to_lod, zoom_stage_camera
+from .camera import camera_image_stem, skyfall_camera_to_lod, zoom_stage_camera
 from .path import add_gz_src
 
 
@@ -234,21 +234,89 @@ def copy_l0_into_gaussian_model(bundle: SkyfallL0, gaussians) -> None:
         gaussians.appearance_enabled = True
 
 
-def add_detail_level(bundle: SkyfallL0, skyfall_cameras: Sequence, roi, factor: float, *, gz_root: str | None = None):
+def extend_base_stage(bundle: SkyfallL0, skyfall_cameras: Sequence, *, gz_root: str | None = None):
+    """Append extra 1× cameras to the L0 stage record without recomputing ``psi_ref``.
+
+    Synthetic Episode cameras are not in the Stage1 training rig. ``add_level``
+    still keys the next stage by name and pose against the base record, so the
+    1× Episode camera must be present there. Train-camera ``psi_ref`` stays as
+    imported.
+    """
+
+    if not skyfall_cameras:
+        raise ValueError("extend_base_stage needs at least one 1× camera.")
+    if len(bundle.lod.layers) != 1 or int(bundle.lod.active_level) != 0:
+        raise ValueError("extend_base_stage only before adding detail levels")
+    if not bundle.lod.stage_records:
+        raise ValueError("extend_base_stage requires a bound L0 base stage")
+    add_gz_src(gz_root)
+    from gaussianzoom_lod.stages import capture_stage
+
+    device = bundle.layer0().xyz.device
+    extra = [
+        skyfall_camera_to_lod(camera, gz_root=gz_root, device=device, use_skyfall_center=True)
+        for camera in skyfall_cameras
+    ]
+    captured = capture_stage(extra, scale=1.0)
+    record = bundle.lod.stage_records[0]
+    existing = {cam["name"] for cam in record["cameras"]}
+    for cam in captured["cameras"]:
+        if cam["name"] in existing:
+            raise ValueError(f"base stage already has camera {cam['name']!r}")
+        record["cameras"].append(cam)
+        existing.add(cam["name"])
+    return extra
+
+
+def add_detail_level(
+    bundle: SkyfallL0,
+    skyfall_cameras: Sequence,
+    roi,
+    factor: float,
+    *,
+    rois: Sequence | None = None,
+    gz_root: str | None = None,
+):
     """Freeze older levels and append an empty detail level.
 
     ``factor`` is the new level's focal zoom versus L0 (2 for L1, 4 for L2).
     Stage cameras keep L0 names so ``validate_next_stage`` can check the focal step.
+    One camera per L0 name: pass a matching ``rois`` sequence for joint coverage.
+
+    The adjacent focal ratio is ``factor / parent_stage_scale``, not the model-wide
+    ``step_scale``. Nonuniform intervals (4× then 2×) keep the stored camera scales
+    as the LoD reference; do not set ``step_scale=4`` or L2 becomes 16×.
     """
 
     if not skyfall_cameras:
         raise ValueError("add_detail_level needs the stage cameras (same names as L0).")
+    if rois is None:
+        rois = [roi] * len(skyfall_cameras)
+    if len(rois) != len(skyfall_cameras):
+        raise ValueError(f"rois ({len(rois)}) must match cameras ({len(skyfall_cameras)})")
+    names = [camera_image_stem(getattr(camera, "image_name", "")) for camera in skyfall_cameras]
+    if len(names) != len(set(names)):
+        raise ValueError(f"stage cameras must have unique L0 names, got {names}")
+    if not bundle.lod.stage_records:
+        raise ValueError("add_detail_level requires a bound L0 base stage")
+    parent_scale = float(bundle.lod.stage_records[-1]["scale"])
+    adjacent = float(factor) / parent_scale
+    if not (adjacent > 1.0):
+        raise ValueError(
+            f"add_detail_level factor={factor} must exceed parent stage scale {parent_scale}; "
+            "do not change the global step_scale to invent later stages."
+        )
     device = bundle.layer0().xyz.device
     stage_cameras = [
-        zoom_stage_camera(camera, roi, factor, gz_root=gz_root, device=device)
-        for camera in skyfall_cameras
+        zoom_stage_camera(camera, tile_roi, factor, gz_root=gz_root, device=device)
+        for camera, tile_roi in zip(skyfall_cameras, rois)
     ]
-    bundle.lod.add_level(stage_cameras)
+    old_step = float(bundle.lod.step_scale)
+    bundle.lod.step_scale = adjacent
+    try:
+        bundle.lod.add_level(stage_cameras)
+    finally:
+        bundle.lod.step_scale = old_step
     if bundle.appearance.gaussian_embeddings is not None:
         dim = int(bundle.appearance.gaussian_embeddings.shape[1])
         empty = bundle.appearance.gaussian_embeddings.new_zeros((0, dim))

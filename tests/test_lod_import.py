@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import torch
 
-from lod.importer import assert_l0_tensors_match, import_skyfall_l0
+from lod.importer import add_detail_level, assert_l0_tensors_match, import_skyfall_l0
+from utils.zoom_camera import NormalizedROI
 
 
 def _fake_camera(name: str, tx: float = 0.0) -> SimpleNamespace:
@@ -85,6 +86,31 @@ class LodImportTests(unittest.TestCase):
         gaussians.filter_3D = None
         with self.assertRaises(ValueError):
             import_skyfall_l0(gaussians, [_fake_camera("a")])
+
+    def test_add_detail_level_rejects_duplicate_l0_names(self) -> None:
+        gaussians = _StubGaussians()
+        cameras = [_fake_camera("a", 0.0), _fake_camera("b", 0.3)]
+        bundle = import_skyfall_l0(gaussians, cameras, step_scale=2.0)
+        roi = NormalizedROI(0.5, 0.5, 0.1, 0.1)
+        with self.assertRaises(ValueError):
+            add_detail_level(bundle, [cameras[0], cameras[0]], roi, 2.0)
+
+    def test_nonuniform_4x_then_8x_keeps_global_step_scale(self) -> None:
+        gaussians = _StubGaussians()
+        cameras = [_fake_camera("a", 0.0), _fake_camera("b", 0.3)]
+        bundle = import_skyfall_l0(gaussians, cameras, step_scale=2.0)
+        roi = NormalizedROI(0.5, 0.5, 0.1, 0.1)
+        add_detail_level(bundle, cameras, roi, 4.0)
+        add_detail_level(bundle, cameras, roi, 8.0)
+        scales = [stage["scale"] for stage in bundle.lod.stage_records]
+        self.assertEqual(bundle.lod.step_scale, 2.0)
+        self.assertEqual(bundle.step_scale, 2.0)
+        self.assertAlmostEqual(scales[0], 1.0, places=6)
+        self.assertAlmostEqual(scales[1], 4.0, places=5)
+        self.assertAlmostEqual(scales[2], 8.0, places=5)
+        self.assertEqual(len(bundle.lod.layers), 3)
+        self.assertEqual(int(bundle.lod.layers[1].xyz.shape[0]), 0)
+        self.assertEqual(int(bundle.lod.layers[2].xyz.shape[0]), 0)
 
 
 if __name__ == "__main__":

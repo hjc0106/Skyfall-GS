@@ -271,9 +271,17 @@ def validate_stage_use(record, cameras, rtol=1e-5):
 
 
 def validate_stage_records(records, step_scale, rtol=0.02):
-    """Validate the chain [base, stage1, ...]: subsets, rigid poses, focal steps, monotonic measured scales."""
+    """Validate the chain [base, stage1, ...]: subsets, rigid poses, measured scales.
+
+    Each non-base stage is checked against its stored ``scale`` (median fx vs
+    the base cameras), not against a global geometric product of ``step_scale``.
+    Adjacent intervals may be nonuniform (for example 1× → 4× → 8×). Changing
+    the model-wide ``step_scale`` would invent later stages (4× then 16×) and
+    is the wrong lever. ``step_scale`` stays in the signature and must be > 1;
+    interval weights read the stored camera scales.
+    """
     rtol = _rtol(rtol)
-    step_scale = _step_scale(step_scale)
+    _step_scale(step_scale)
     if records is None or isinstance(records, (str, bytes, Mapping)):
         raise ValueError(f"validate_stage_records: records must be a non-empty sequence, got {type(records).__name__}")
     try:
@@ -287,8 +295,9 @@ def validate_stage_records(records, step_scale, rtol=0.02):
     for i, record in enumerate(items[1:], 1):
         where = f"validate_stage_records: record {i}"
         scale, cams, _ = _record(record, where)
-        _checked_stage(base_index, cams, prev_scale, step_scale, rtol, where)
         if not scale > prev_scale:
             raise ValueError(f"{where}: stage scale {scale!r} does not increase on previous stage scale {prev_scale!r}")
+        adjacent = scale / prev_scale
+        _checked_stage(base_index, cams, prev_scale, adjacent, rtol, where)
         _check_stored_scale(base_index, scale, cams, where)
         prev_scale = scale

@@ -391,6 +391,7 @@ This project includes several other useful scripts:
 -   `render_videos.py`: A script for batch rendering of videos from multiple models and camera paths.
 -   `sat_utils.py`: Utility functions for handling satellite images and georeferenced data.
 -   `scripts/merge_images.py`: Merge two frames into one.
+-   [`docs/lod_jax068_five_episode.md`](docs/lod_jax068_five_episode.md): Reproduce the independent JAX_068 L0-start five-episode LoD experiment.
 
 ## Acknowledgement
 
