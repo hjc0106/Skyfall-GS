@@ -20,6 +20,20 @@ from typing import Any, List, Dict
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: Selectable rasterizer backends. ``diff_gauss`` keeps the original
+#: Skyfall ``diff_gauss`` kernel; ``rade`` routes through the official
+#: RaDe-GS ``diff_gaussian_rasterization`` (see lod/rasterizer.py).
+RASTERIZER_BACKENDS: tuple = ("diff_gauss", "rade")
+
+#: argparse ``choices`` per clean attribute name, enforced both on the
+#: command line and when values are loaded back from a saved ``cfg_args``.
+_ARGUMENT_CHOICES: Dict[str, tuple] = {"rasterizer_backend": RASTERIZER_BACKENDS}
+
+
+def has_explicit_flag(flag: str) -> bool:
+    """True when ``--flag`` or ``--flag=...`` appears on the command line."""
+
+    return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
 
 @dataclass
 class IDUParams:
@@ -50,7 +64,6 @@ class ParamGroup:
         
         for attr_name, default_value in vars(self).items():
             self._add_argument(group, attr_name, default_value, fill_none)
-    
     def _add_argument(self, group, attr_name: str, default_value: Any, fill_none: bool):
         """Add a single argument to the parser group."""
         # Check if attribute should have shorthand (starts with underscore)
@@ -65,9 +78,12 @@ class ParamGroup:
         if has_shorthand:
             arg_names.append(f"-{clean_name[0]}")
         
-        # Add argument based on type
+        # Add argument based on type; known choices are enforced by argparse
+        choices = _ARGUMENT_CHOICES.get(clean_name)
         if value_type == bool:
             group.add_argument(*arg_names, default=final_default, action="store_true")
+        elif choices:
+            group.add_argument(*arg_names, default=final_default, type=value_type, choices=choices)
         else:
             group.add_argument(*arg_names, default=final_default, type=value_type)
     
@@ -82,10 +98,14 @@ class ParamGroup:
             GroupParams object with extracted values
         """
         group = GroupParams()
-        
         for arg_name, arg_value in vars(args).items():
             # Check both with and without underscore prefix
             if arg_name in vars(self) or f"_{arg_name}" in vars(self):
+                choices = _ARGUMENT_CHOICES.get(arg_name)
+                if choices is not None and arg_value not in choices:
+                    raise ValueError(
+                        f"Invalid {arg_name}={arg_value!r}; expected one of {list(choices)}"
+                    )
                 setattr(group, arg_name, arg_value)
         
         return group
@@ -134,6 +154,10 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser: ArgumentParser):
         self.convert_SHs_python: bool = False
         self.compute_cov3D_python: bool = False
+        # Which rasterizer kernel ``gaussian_renderer.render`` dispatches to.
+        # Persisted in ``cfg_args`` so later renders/resume honor the run's
+        # backend instead of silently reverting to ``diff_gauss``.
+        self.rasterizer_backend: str = "diff_gauss"
         self.debug: bool = False
         
         super().__init__(parser, "Pipeline Parameters")
@@ -141,7 +165,6 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     """Parameters for optimization and training."""
-    
     # Constants
     DEFAULT_ITERATIONS = 30_000
     DEFAULT_DENSIFY_UNTIL = 20_000
@@ -202,6 +225,17 @@ class OptimizationParams(ParamGroup):
         # GaussianZoom Stage 2 synthesis parameters
         self._init_gaussianzoom_params()
 
+        # Default to the original pure FlowEdit IDU path. GaussianZoom/DLoRAL
+        # is a separate, explicitly selected refinement backend.
+        self.idu_refine_backend: str = "flowedit"
+
+        # Original README recipe: fixed 4/10. The published batch scripts
+        # explicitly set n_max_end=10 for per-image U(4,10) sampling.
+        self.idu_flow_edit_n_min: int = 4
+        self.idu_flow_edit_n_max: int = 10
+        self.idu_flow_edit_n_max_end: int = -1
+        self.idu_flow_edit_n_avg: int = 1
+
         # Post-training
         self.post_training_iterations: int = 500
 
@@ -253,6 +287,17 @@ class OptimizationParams(ParamGroup):
         self.idu_grid_width: int = 256
         self.idu_grid_height: int = 256
         self.idu_grid_size: int = 2
+
+        # External FlowEdit supervision (optional). When set together with
+        # --idu_refine_backend flowedit, IDU episodes consume the repaired images
+        # listed in a ``skyfall_flowedit_views`` manifest instead of rendering and
+        # refining new curriculum views. The manifest's checkpoint is the ORIGINAL
+        # source checkpoint; training output still goes to this run's model_path.
+        self.idu_supervision_manifest: str = ""
+        # Episode cap: 0 keeps the full existing curriculum unchanged; a positive
+        # value runs at most that many episodes (required, >= 1, with
+        # --idu_supervision_manifest).
+        self.idu_episode_count: int = 0
     
     def _init_gaussianzoom_params(self):
         """Initialize GaussianZoom Stage 2 synthesis parameters.
@@ -329,5 +374,25 @@ def get_combined_args(parser: ArgumentParser) -> Namespace:
     for key, value in vars(cmdline_args).items():
         if value is not None:
             merged_dict[key] = value
+    # A saved run's rasterizer_backend must not be silently reverted to the
+    # command-line default (``diff_gauss``): later renders/resume have to keep
+    # rasterizing with the backend the run was trained with. An explicit
+    # ``--rasterizer_backend`` on the command line still wins.
+    saved_backend = vars(config_args).get("rasterizer_backend")
+    cmdline_backend = getattr(cmdline_args, "rasterizer_backend", None)
+    if (
+        saved_backend is not None
+        and not has_explicit_flag("--rasterizer_backend")
+        and cmdline_backend is not None
+        and cmdline_backend != saved_backend
+    ):
+        if saved_backend in RASTERIZER_BACKENDS:
+            print(f"Keeping saved rasterizer_backend '{saved_backend}' (command line default was '{cmdline_backend}')")
+            merged_dict["rasterizer_backend"] = saved_backend
+        else:
+            raise ValueError(
+                f"Saved cfg_args has invalid rasterizer_backend={saved_backend!r}; "
+                f"expected one of {list(RASTERIZER_BACKENDS)}"
+            )
     
     return Namespace(**merged_dict)

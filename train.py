@@ -11,6 +11,7 @@
 
 import os
 import copy
+import shutil
 import gc
 import time
 from io import BytesIO
@@ -30,8 +31,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams, IDUParams
-
+from arguments import ModelParams, PipelineParams, OptimizationParams, IDUParams, RASTERIZER_BACKENDS, has_explicit_flag
 from utils.camera_utils import gen_idu_orbit_camera, cameraList_from_camInfos
 from scene.dataset_readers import CameraInfo
 
@@ -44,6 +44,13 @@ from refinement.stage2_gaussianzoom import (
     prepare_stage2_inputs,
     refine_stage2_inputs,
     validate_stage2_options,
+)
+from refinement.flowedit_stage2 import (
+    build_flowedit_views_manifest,
+    load_flowedit_views_manifest,
+    refine_flowedit_views,
+    render_flowedit_views,
+    validate_flowedit_options,
 )
 from refinement.types import RenderBundle
 
@@ -97,6 +104,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lpips_loss_fn.cuda()
         print("Initialized LPIPS loss")
     first_iter = 0
+    # cfg_args is written from the ModelParams group only; carry the
+    # rasterizer backend so later renders/resume can honor it.
+    dataset.rasterizer_backend = pipe.rasterizer_backend
     tb_writer = prepare_output_and_logger(dataset)
     moge_standalone = (
         MoGeIDU(os.path.join(dataset.model_path, "depth_tmp"), "cuda:0", 60.0)
@@ -365,12 +375,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
 def idu_episode_dirname(episode_idx: int, elevation, radius) -> str:
+    if elevation is None or radius is None:
+        # External supervision episodes carry no orbit elevation/radius.
+        return f"episode_{episode_idx:02d}"
     if isinstance(elevation, list) or isinstance(radius, list):
         return f"episode_{episode_idx:02d}"
     return f"episode_{episode_idx:02d}_e{elevation:g}_r{radius:g}"
 
 
-def write_idu_compare_html(episode_dir: str, n_images: int, episode_idx: int, elevation, radius) -> None:
+def write_idu_compare_html(episode_dir: str, n_images: int, episode_idx: int, elevation, radius, middle_label: str = "GaussianZoom / DLoRAL") -> None:
     rows = []
     for idx in range(n_images):
         name = f"{idx:05d}.png"
@@ -393,7 +406,7 @@ def write_idu_compare_html(episode_dir: str, n_images: int, episode_idx: int, el
   td, th {{ padding: 6px; vertical-align: top; }}
 </style></head><body>
 <h2>Episode {episode_idx:02d} · e={elevation} · r={radius}</h2>
-<p>left: 3DGS render · middle: GaussianZoom / DLoRAL · right: after this episode's 3DGS training (filled later)</p>
+<p>left: 3DGS render · middle: {middle_label} · right: after this episode's 3DGS training (filled later)</p>
 <table>
 <tr><th>id</th><th>render</th><th>render_refine</th><th>render_after_train</th></tr>
 {''.join(rows)}
@@ -433,9 +446,9 @@ def update_idu_root_index(model_path: str, record: dict) -> None:
 
 
 @torch.no_grad()
-def save_idu_after_train_renders(views, gaussians, pipeline, background, kernel_size, save_dir: str) -> None:
+def save_idu_after_train_renders(views, gaussians, pipeline, background, kernel_size, save_dir: str, *, description: str = "IDU after-train render") -> None:
     os.makedirs(save_dir, exist_ok=True)
-    for idx, view in enumerate(tqdm(views, desc="IDU after-train render")):
+    for idx, view in enumerate(tqdm(views, desc=description)):
         rendering = render(view, gaussians, pipeline, background, kernel_size=kernel_size, testing=True)["render"]
         img = rendering.detach().cpu().permute(1, 2, 0).numpy()
         Image.fromarray((img * 255 + 0.5).clip(0, 255).astype(np.uint8)).save(
@@ -460,12 +473,19 @@ def generate_idu_training_set(
     fov_x: float = 60.0,
     episode_idx: int = 0,
 ):
-    """Refine every curriculum view with geometry-guided DLoRAL, then infer depth.
+    """Refine every curriculum view with the selected Stage 2 backend, then infer depth.
 
-    Rendering/geometry, Qwen/DLoRAL generation, and MoGe depth are separate
-    phases. Only CPU CameraInfo metadata and disk-backed inputs cross phases.
+    Rendering (and geometry, for the GaussianZoom backend), generative
+    refinement, and MoGe depth are separate phases. Only CPU CameraInfo
+    metadata and disk-backed inputs cross phases.
     """
-    validate_stage2_options(options)
+    refine_backend = getattr(options, "idu_refine_backend", "flowedit")
+    if refine_backend == "flowedit":
+        validate_flowedit_options(options)
+    elif refine_backend == "gaussianzoom":
+        validate_stage2_options(options)
+    else:
+        raise ValueError(f"Unknown idu_refine_backend: {refine_backend!r}")
     if idu_num_cams < 1 or idu_num_samples_per_view < 1:
         raise ValueError("IDU needs positive camera and per-view sample counts")
 
@@ -517,10 +537,13 @@ def generate_idu_training_set(
         [1, 1, 1] if dataset.white_background else [0, 0, 0],
         dtype=torch.float32, device="cuda",
     )
-    context_images = [
-        (camera, to_pil_image(camera.original_image.detach().cpu()))
-        for camera in scene.getTrainCameras()
-    ]
+    if refine_backend == "gaussianzoom":
+        context_images = [
+            (camera, to_pil_image(camera.original_image.detach().cpu()))
+            for camera in scene.getTrainCameras()
+        ]
+    else:
+        context_images = []
 
     def render_view(camera):
         package = render(
@@ -532,16 +555,30 @@ def generate_idu_training_set(
             alpha=package["render_alpha"], camera=camera,
         )
 
-    prepared = prepare_stage2_inputs(
-        views, context_images, render_view,
-        checkpoint_path=checkpoint_path, episode_dir=episode_root,
-        episode_idx=episode_idx, options=options,
-    )
-    del render_view, context_images, views, scene, gaussians, model_params, background
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    final_imgs = refine_stage2_inputs(prepared, options=options)
+    if refine_backend == "flowedit":
+        # Pure FlowEdit: render each unique pose once, then repair the renders
+        # with the original FlowEdit sampler. No geometry flow, Qwen prompts
+        # or DLoRAL models are involved.
+        prepared = render_flowedit_views(
+            views, render_view,
+            checkpoint_path=checkpoint_path, episode_dir=episode_root,
+            episode_idx=episode_idx, options=options,
+        )
+        # Release the scene, Gaussians and camera tensors before FLUX loads.
+        del render_view, context_images, views, scene, gaussians, model_params, background
+        gc.collect()
+        torch.cuda.empty_cache()
+        final_imgs = refine_flowedit_views(prepared, options=options)
+    else:
+        prepared = prepare_stage2_inputs(
+            views, context_images, render_view,
+            checkpoint_path=checkpoint_path, episode_dir=episode_root,
+            episode_idx=episode_idx, options=options,
+        )
+        del render_view, context_images, views, scene, gaussians, model_params, background
+        gc.collect()
+        torch.cuda.empty_cache()
+        final_imgs = refine_stage2_inputs(prepared, options=options)
     expected_count = len(unique_infos) * idu_num_samples_per_view
     if len(final_imgs) != expected_count:
         raise RuntimeError(f"Expected {expected_count} refined IDU samples, got {len(final_imgs)}")
@@ -573,6 +610,8 @@ def generate_idu_training_set(
     final_cameras = cameraList_from_camInfos(
         final_idu_infos, 1, generated_dataset, is_idu=True,
     )
+    refinement_method = "flowedit" if refine_backend == "flowedit" else "gaussianzoom_dloral"
+    refine_label = "FlowEdit" if refine_backend == "flowedit" else "GaussianZoom / DLoRAL"
     meta = {
         "episode_idx": episode_idx,
         "dirname": episode_name,
@@ -585,7 +624,7 @@ def generate_idu_training_set(
         "refine_dir": os.path.join(episode_root, "render_refine"),
         "depth_dir": depth_path,
         "checkpoint_used": checkpoint_path,
-        "refinement_method": "gaussianzoom_dloral",
+        "refinement_method": refinement_method,
         "refinement_inputs": prepared,
         "cameras": [
             {"index": index, "uid": info.uid, "image_name": info.image_name}
@@ -594,14 +633,147 @@ def generate_idu_training_set(
     }
     with open(os.path.join(episode_root, "episode_meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle, indent=2, ensure_ascii=False)
-    write_idu_compare_html(episode_root, expected_count, episode_idx, elevation, radius)
+    if refine_backend == "flowedit":
+        with open(os.path.join(episode_root, "flowedit_views.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                build_flowedit_views_manifest(
+                    prepared, checkpoint=checkpoint_path,
+                    episode_idx=episode_idx, samples_per_view=idu_num_samples_per_view,
+                ),
+                handle, indent=2, ensure_ascii=False,
+            )
+    write_idu_compare_html(episode_root, expected_count, episode_idx, elevation, radius,
+                           middle_label=refine_label)
     update_idu_root_index(dataset.model_path, {
         "episode_idx": episode_idx, "dirname": episode_name,
         "elevation": elevation, "radius": radius, "n_images": expected_count,
-        "refinement_method": "gaussianzoom_dloral",
+        "refinement_method": refinement_method,
     })
-    print(f"Saved GaussianZoom IDU episode artifacts to {episode_root}")
+    print(f"Saved {refine_label} IDU episode artifacts to {episode_root}")
     return final_cameras
+
+@torch.no_grad()
+def load_idu_supervision_training_set(
+    dataset: ModelParams,
+    manifest_path: str,
+    *,
+    episode_idx: int,
+    start_checkpoint: str,
+):
+    """Build native IDU cameras from an external ``skyfall_flowedit_views`` manifest.
+
+    The manifest lists fixed FlowEdit-repaired targets rendered from the ORIGINAL
+    source checkpoint. They are consumed as-is (no re-render, no extra FlowEdit
+    pass, no resize); only the MoGe depths are newly inferred, reusing the
+    native ``render_depth`` persistence. Cameras keep the manifest snapshot's
+    R/T/FoV/principal point and join the standard full-parameter IDU episode as
+    ``scene.train_idu_cameras[1.0]``, where the native render path applies the
+    appearance-6 embedding to synthetic views exactly as the built-in curriculum.
+    """
+    manifest = load_flowedit_views_manifest(
+        manifest_path, expected_checkpoint=start_checkpoint)
+    views = manifest["views"]
+    episode_name = idu_episode_dirname(episode_idx, None, None)
+    episode_root = os.path.join(dataset.model_path, "idu", episode_name)
+    os.makedirs(episode_root, exist_ok=True)
+    render_dir = os.path.join(episode_root, "render")
+    refine_dir = os.path.join(episode_root, "render_refine")
+    depth_path = os.path.join(episode_root, "render_depth")
+    for directory in (render_dir, refine_dir, depth_path):
+        os.makedirs(directory, exist_ok=True)
+
+    width = int(views[0]["camera"]["image_width"])
+    height = int(views[0]["camera"]["image_height"])
+    fov_x_radians = float(views[0]["camera"]["fov_x"])
+
+    images = []
+    for index, view in enumerate(views):
+        image = Image.open(view["image_path"]).convert("RGB")
+        if image.size != (width, height):
+            raise ValueError(
+                f"Supervision image {view['image_path']} is {image.size}, expected {(width, height)}"
+            )
+        target_path = os.path.join(refine_dir, f"{index:05d}.png")
+        shutil.copyfile(view["image_path"], target_path)
+        images.append(image)
+
+    moge = MoGeIDU(depth_path, device="cuda:0", fov_x=math.degrees(fov_x_radians))
+    try:
+        depths = moge.run(images)
+    finally:
+        del moge
+        gc.collect()
+        torch.cuda.empty_cache()
+    if len(depths) != len(views):
+        raise RuntimeError("MoGe returned a different number of depths than supervision images")
+    # Same render_depth/*.npy persistence as the native generation path.
+    for index, depth in enumerate(depths):
+        np.save(os.path.join(depth_path, f"{index:05d}.npy"), depth)
+
+    final_idu_infos = []
+    for index, (view, image, depth) in enumerate(zip(views, images, depths)):
+        camera = view["camera"]
+        final_idu_infos.append(CameraInfo(
+            uid=1000 + index,
+            R=np.array(camera["R"], dtype=np.float64),
+            T=np.array(camera["T"], dtype=np.float64),
+            FovY=float(camera["fov_y"]),
+            FovX=float(camera["fov_x"]),
+            cx=float(camera["cx"]),
+            cy=float(camera["cy"]),
+            image=image,
+            image_path=view["image_path"],
+            image_name=view["id"],
+            depth=depth,
+            mask=None,
+            width=width,
+            height=height,
+        ))
+    generated_dataset = copy.copy(dataset)
+    generated_dataset.resolution = 1
+    final_cameras = cameraList_from_camInfos(
+        final_idu_infos, 1, generated_dataset, is_idu=True,
+    )
+
+    meta = {
+        "episode_idx": episode_idx,
+        "dirname": episode_name,
+        "elevation": None,
+        "radius": None,
+        "supervision_manifest": os.path.abspath(manifest_path),
+        "manifest_episode_idx": manifest["episode_idx"],
+        "checkpoint_used": manifest["checkpoint"],
+        "n_views": len(views),
+        "samples_per_view": 1,
+        "n_images": len(views),
+        "width": width,
+        "height": height,
+        "render_dir": render_dir,
+        "refine_dir": refine_dir,
+        "depth_dir": depth_path,
+        "refinement_method": "flowedit_supervision",
+        "cameras": [
+            {"index": index, "uid": 1000 + index, "image_name": view["id"]}
+            for index, view in enumerate(views)
+        ],
+    }
+    with open(os.path.join(episode_root, "episode_meta.json"), "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2, ensure_ascii=False)
+    with open(os.path.join(episode_root, "flowedit_views.json"), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, ensure_ascii=False)
+    write_idu_compare_html(
+        episode_root, len(views), episode_idx, None, None,
+        middle_label="FlowEdit supervision",
+    )
+    update_idu_root_index(dataset.model_path, {
+        "episode_idx": episode_idx, "dirname": episode_name,
+        "elevation": None, "radius": None, "n_images": len(views),
+        "refinement_method": "flowedit_supervision",
+    })
+    print(f"Loaded {len(views)} FlowEdit supervision views for IDU episode {episode_idx} "
+          f"from {manifest_path}")
+    return final_cameras
+
 
 @torch.no_grad()
 def generate_pseudo_cams(
@@ -661,22 +833,30 @@ def training_idu_episode(
         targets, elevation, radius, fov,
         idu_num_cams, idu_num_samples_per_view,
         episode_idx: int = 0,
+        supervision_cameras=None,
     ):
     # Refine all extrapolated curriculum views, then optimize the full 3DGS.
-    # Generate IDU training set
-    if not opt.idu_no_curriculum:
-        assert isinstance(elevation, float) and isinstance(radius, float)
+    if supervision_cameras is not None:
+        # External ``skyfall_flowedit_views`` supervision: the cameras were built
+        # from the manifest and are reused as-is for this native IDU episode.
+        idu_cam_list = supervision_cameras
     else:
-        assert isinstance(elevation, list) and isinstance(radius, list), "Elevation and radius should be list when no_curriculum is True"
-    
-    idu_cam_list = generate_idu_training_set(
-        dataset, checkpoint_path, pipe, targets, elevation, radius,
-        idu_num_cams, idu_num_samples_per_view,
-        options=opt, height=opt.idu_render_size, width=opt.idu_render_size,
-        fov_x=fov, episode_idx=episode_idx,
-    )
+        # Generate IDU training set
+        if not opt.idu_no_curriculum:
+            assert isinstance(elevation, float) and isinstance(radius, float)
+        else:
+            assert isinstance(elevation, list) and isinstance(radius, list), "Elevation and radius should be list when no_curriculum is True"
+        idu_cam_list = generate_idu_training_set(
+            dataset, checkpoint_path, pipe, targets, elevation, radius,
+            idu_num_cams, idu_num_samples_per_view,
+            options=opt, height=opt.idu_render_size, width=opt.idu_render_size,
+            fov_x=fov, episode_idx=episode_idx,
+        )
 
     # load Gaussians and scene
+    # cfg_args is written from the ModelParams group only; carry the
+    # rasterizer backend so later renders/resume can honor it.
+    dataset.rasterizer_backend = pipe.rasterizer_backend
     tb_writer = prepare_output_and_logger(dataset)
     if opt.use_lpips_loss:
         lpips_loss_fn = lpips.LPIPS(net=opt.lpips_net)
@@ -736,6 +916,14 @@ def training_idu_episode(
             highresolution_index.append(index)
 
     gaussians.compute_3D_filter(cameras=trainCameras + trainIDUCameras)
+    if supervision_cameras is not None:
+        before_dir = os.path.join(
+            dataset.model_path, "idu", idu_episode_dirname(episode_idx, None, None), "render"
+        )
+        save_idu_after_train_renders(
+            trainIDUCameras, gaussians, pipe, background, dataset.kernel_size,
+            before_dir, description="IDU before-train render",
+        )
 
     viewpoint_train_stack = None
     viewpoint_train_idu_stack = None
@@ -1020,7 +1208,15 @@ def training_idu_episode(
     return checkpoint_path
 
 def training_idu(dataset, opt, pipe, init_checkpoint_path):
-    validate_stage2_options(opt)
+    refine_backend = getattr(opt, "idu_refine_backend", "flowedit")
+    if refine_backend == "flowedit":
+        validate_flowedit_options(opt)
+        print("===== IDU Stage 2 refinement backend: FlowEdit (original baseline) =====")
+    elif refine_backend == "gaussianzoom":
+        validate_stage2_options(opt)
+        print("===== IDU Stage 2 refinement backend: GaussianZoom + DLoRAL =====")
+    else:
+        raise ValueError(f"Unknown idu_refine_backend: {refine_backend!r}")
     if not init_checkpoint_path or not os.path.isfile(init_checkpoint_path):
         raise ValueError("Stage2 requires an existing --start_checkpoint")
     start_checkpoint_path = init_checkpoint_path
@@ -1082,9 +1278,43 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
         if retired["skipped"]:
             print(f"[compact] superseded-pair retirement skipped: {retired['skipped']}")
 
-    if not opt.idu_no_curriculum:
-        
-        for episode_idx, (radius, elevation) in enumerate(zip(opt.idu_radius_list, opt.idu_elevation_list)):
+    supervision_manifest = getattr(opt, "idu_supervision_manifest", "") or ""
+    episode_cap = int(getattr(opt, "idu_episode_count", 0) or 0)
+    if episode_cap < 0:
+        raise ValueError("idu_episode_count must be >= 0 (0 keeps the full curriculum)")
+    if supervision_manifest:
+        if refine_backend != "flowedit":
+            raise ValueError(
+                "--idu_supervision_manifest consumes plain FlowEdit-repaired views and "
+                "requires --idu_refine_backend flowedit"
+            )
+        if episode_cap < 1:
+            raise ValueError(
+                "--idu_episode_count must be >= 1 when --idu_supervision_manifest is set"
+            )
+        print(f"===== IDU supervision manifest: {supervision_manifest} =====")
+
+    if supervision_manifest:
+        for episode_idx in range(episode_cap):
+            supervision_cameras = load_idu_supervision_training_set(
+                dataset, supervision_manifest,
+                episode_idx=episode_idx, start_checkpoint=init_checkpoint_path,
+            )
+            start_checkpoint_path = training_idu_episode(
+                dataset, opt, pipe,
+                checkpoint_path=start_checkpoint_path,
+                targets=targets, elevation=None, radius=None, fov=opt.idu_fov,
+                idu_num_cams=opt.idu_num_cams,
+                idu_num_samples_per_view=opt.idu_num_samples_per_view,
+                episode_idx=episode_idx,
+                supervision_cameras=supervision_cameras,
+            )
+            retire_superseded_pair(episode_idx)
+    elif not opt.idu_no_curriculum:
+        course = list(zip(opt.idu_radius_list, opt.idu_elevation_list))
+        if episode_cap > 0:
+            course = course[:episode_cap]
+        for episode_idx, (radius, elevation) in enumerate(course):
             print(f"Training IDU episode {episode_idx} with elevation {elevation} and radius {radius}")
             print(f"# of IDU targets: {len(targets)}")
             start_checkpoint_path = training_idu_episode(
@@ -1100,7 +1330,10 @@ def training_idu(dataset, opt, pipe, init_checkpoint_path):
         print("===== Disable IDU curriculum learning =====")
         assert opt.idu_episode_iterations == 10000, "IDU episode iterations should be 10000"
         assert opt.idu_densify_until_iter == 9000, "IDU episode iterations should be 9000"
-        for episode_idx in range(5):
+        episodes = list(range(5))
+        if episode_cap > 0:
+            episodes = episodes[:episode_cap]
+        for episode_idx in episodes:
             start_checkpoint_path = training_idu_episode(
                 dataset, opt, pipe, 
                 checkpoint_path=start_checkpoint_path,
@@ -1278,6 +1511,49 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         torch.cuda.empty_cache()
     return metrics
 
+def honor_saved_rasterizer_backend(args: Namespace) -> None:
+    """Keep a saved run's rasterizer backend across resume/re-runs.
+
+    ``cfg_args`` records the backend the run was trained with. Without an
+    explicit ``--rasterizer_backend`` on the command line, re-running into the
+    same ``--model_path`` (resume, continued stages) or resuming from a
+    checkpoint directory must restore that backend instead of silently
+    reverting to the ``diff_gauss`` default. Unreadable or invalid saved
+    configs raise instead of falling back silently.
+    """
+
+    if has_explicit_flag("--rasterizer_backend"):
+        return
+    candidates = []
+    if args.model_path:
+        candidates.append(os.path.join(args.model_path, "cfg_args"))
+    start_checkpoint = getattr(args, "start_checkpoint", None)
+    if start_checkpoint:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(start_checkpoint)), "cfg_args"))
+    for cfg_path in candidates:
+        if not os.path.exists(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r") as cfg_file:
+                saved = eval(cfg_file.read())
+            saved_backend = getattr(saved, "rasterizer_backend", None)
+        except Exception as exc:
+            raise ValueError(f"Could not read saved config {cfg_path}: {exc}") from exc
+        if saved_backend is None:
+            # Pre-backend cfg_args: the run was trained with diff_gauss.
+            continue
+        if saved_backend not in RASTERIZER_BACKENDS:
+            raise ValueError(
+                f"{cfg_path} has invalid rasterizer_backend={saved_backend!r}; "
+                f"expected one of {list(RASTERIZER_BACKENDS)}"
+            )
+        if saved_backend != args.rasterizer_backend:
+            print(f"[rasterizer_backend] Restoring saved backend '{saved_backend}' from {cfg_path} "
+                  f"(command line default was '{args.rasterizer_backend}')")
+            args.rasterizer_backend = saved_backend
+        return
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -1295,6 +1571,8 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--iterative_datasets_update", action="store_true")
     args = parser.parse_args(sys.argv[1:])
+    honor_saved_rasterizer_backend(args)
+    print("Rasterizer backend: {}".format(args.rasterizer_backend))
     args.save_iterations.append(args.iterations)
     _COMPACT_RETENTION = bool(getattr(args, "compact_retention", False))
     

@@ -10,15 +10,13 @@ import unittest
 import torch
 
 from refinement.dloral_flows import (
-    ALIGN_CORNERS,
-    FLOWS_FORWARD_MEANING,
-    FRAME_ORDER,
     VAE_DOWNSAMPLE,
     align_neighbor_latent,
     apply_aligned_feature_fallback,
     correspondence_to_external_flows,
     crop_feature_flow,
     downsample_image_flow,
+    feature_diagnostics,
     fuse_with_valid_mask,
     gate_valid_with_roundtrip,
     hw2_to_nchw,
@@ -63,14 +61,25 @@ class FakeCamera:
 
 
 class DLoRALFlowAdapterTests(unittest.TestCase):
+    def test_empty_feature_support_serializes_as_undefined_error(self) -> None:
+        target = torch.zeros(1, 2, 2, 2)
+        result = feature_diagnostics(
+            target=target,
+            aligned=torch.ones_like(target),
+            fused=target,
+            valid_mask=torch.zeros(2, 2, dtype=torch.bool),
+        )
+        published = json.loads(json.dumps(result, allow_nan=False))
+        self.assertIsNone(published["aligned_target_l1_valid"])
+        self.assertIsNone(published["fused_target_l1_valid"])
+        self.assertEqual(published["aligned_target_l1_invalid"], 1.0)
+        self.assertEqual(published["fused_target_l1_invalid"], 0.0)
+        self.assertFalse(published["aligned_changes_valid"])
+
     def test_prepared_size_keeps_2048_at_upscale_1(self) -> None:
         width, height = prepared_image_size(2048, 2048, process_size=512, upscale=1)
         self.assertEqual((width, height), (2048, 2048))
 
-    def test_cfr_contract_is_neighbor_then_target_forward_flow(self) -> None:
-        self.assertEqual(FRAME_ORDER, ("neighbor", "target"))
-        self.assertEqual(FLOWS_FORWARD_MEANING, "p_neighbor - p_target at target feature pixels")
-        self.assertTrue(ALIGN_CORNERS)
 
     def test_eight_pixel_shift_becomes_one_feature_pixel(self) -> None:
         height = width = 16

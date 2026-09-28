@@ -111,6 +111,10 @@ def main() -> None:
     extract_parser = argparse.ArgumentParser(add_help=False)
     dataset = ModelParams(extract_parser).extract(args)
     pipe = PipelineParams(extract_parser).extract(args)
+    # The "native" reference render must stay on the original diff_gauss
+    # kernel for the cross-rasterizer comparison, regardless of the Stage1
+    # run's persisted backend.
+    pipe.rasterizer_backend = "diff_gauss"
     dataset.model_path = output_dir
 
     gaussians = GaussianModel(

@@ -60,6 +60,7 @@ exec "$SKYFALL_PY" train.py \
   -m "$OUTPUT_DIR" \
   --start_checkpoint "$START_CHECKPOINT" \
   --iterative_datasets_update \
+  --idu_refine_backend gaussianzoom \
   --eval \
   --port "$PORT" \
   --kernel_size 0.1 \

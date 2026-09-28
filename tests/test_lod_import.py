@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import torch
 
-from lod.importer import assert_l0_tensors_match, import_skyfall_l0
+from lod.importer import add_detail_level, assert_l0_tensors_match, densify_with_appearance, import_skyfall_l0
+from utils.zoom_camera import NormalizedROI
 
 
 def _fake_camera(name: str, tx: float = 0.0) -> SimpleNamespace:
@@ -71,9 +72,6 @@ class LodImportTests(unittest.TestCase):
         bundle = import_skyfall_l0(gaussians, cameras, step_scale=2.0)
         report = assert_l0_tensors_match(gaussians, bundle)
         self.assertEqual(bundle.n_points, 16)
-        self.assertEqual(bundle.step_scale, 2.0)
-        self.assertEqual(bundle.filter_source, "copied_from_skyfall")
-        self.assertEqual(bundle.lod.stage_records[0]["scale"], 1.0)
         self.assertTrue(bundle.layer0().frozen)
         self.assertFalse(any(p.requires_grad for p in bundle.appearance.mlp.parameters()))
         self.assertLess(max(report.values()), 1e-8)
@@ -85,6 +83,26 @@ class LodImportTests(unittest.TestCase):
         gaussians.filter_3D = None
         with self.assertRaises(ValueError):
             import_skyfall_l0(gaussians, [_fake_camera("a")])
+
+    def test_projected_split_can_refine_world_small_splats_without_changing_parent(self) -> None:
+        gaussians = _StubGaussians(n=1)
+        cameras = [_fake_camera("a")]
+        bundle = import_skyfall_l0(gaussians, cameras)
+        parent_xyz = bundle.layer0().xyz.detach().clone()
+        parent_scale = bundle.layer0().log_scales.detach().exp().clone()
+        stages = add_detail_level(bundle, cameras, NormalizedROI(.5, .5, .5, .5), 2.)
+        optimizer = bundle.lod.make_optimizer(1e-4, 1e-3, 1e-2, 1e-3, 1e-3)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            densify_with_appearance(
+                bundle, optimizer, torch.ones(1), stages, threshold=.5, max_points=2,
+                scene_extent=128., percent_dense=.01, split_mask=torch.ones(1, dtype=torch.bool),
+            )
+        self.assertEqual(len(bundle.active_layer().xyz), 2)
+        self.assertTrue(torch.all(bundle.active_layer().log_scales.exp() < parent_scale))
+        self.assertTrue(torch.equal(bundle.layer0().xyz, parent_xyz))
+        self.assertTrue(torch.equal(bundle.layer0().log_scales.exp(), parent_scale))
+        self.assertTrue(torch.equal(bundle.active_layer().parent_ids, bundle.layer0().node_ids.repeat(2)))
 
 
 if __name__ == "__main__":

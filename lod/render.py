@@ -26,8 +26,21 @@ def appearance_colors_lod(
     camera_center: torch.Tensor,
     image_embedding: torch.Tensor | None,
     active_sh_degree: int,
+    frozen_colors: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Frozen MLP, live SH/xyz. Do not wrap this in ``no_grad`` or ``detach`` SH."""
+    """Frozen MLP; cache only completed prefixes, never detach active SH/xyz."""
+
+    if frozen_colors is not None:
+        count = int(frozen_colors.shape[0])
+        if frozen_colors.shape != (count, 3) or count > xyz.shape[0] or frozen_colors.requires_grad:
+            raise ValueError("Frozen colors must be a detached RGB prefix")
+        if count == xyz.shape[0]:
+            return frozen_colors
+        active = appearance_colors_lod(
+            xyz[count:], sh[count:], gaussian_embeddings[count:], appearance,
+            camera_center, image_embedding, active_sh_degree,
+        )
+        return torch.cat((frozen_colors, active), dim=0)
 
     if appearance.enabled and appearance.mlp is not None and image_embedding is not None:
         aemb = image_embedding.reshape(1, -1).expand(int(xyz.shape[0]), -1)
@@ -83,6 +96,7 @@ def render_lod_appearance(
     debug: bool = False,
     scaling_modifier: float = 1.0,
     gz_root: str | None = None,
+    frozen_colors: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Training rasterizer: merged L0+L1, LoD opacity, frozen appearance, Skyfall pose."""
 
@@ -96,6 +110,21 @@ def render_lod_appearance(
     image_embedding = appearance_embedding
     if image_embedding is None and bundle.appearance.enabled:
         image_embedding = bundle.appearance.embedding_for_uid(int(camera.uid), is_train_view=True)
+    if frozen_colors is not None:
+        count = 0
+        for layer in bundle.lod.layers[:n_levels]:
+            if count == len(frozen_colors):
+                break
+            if not layer.frozen or any(parameter.requires_grad for parameter in layer.parameters()):
+                raise ValueError("Color caching requires a completely frozen layer prefix")
+            count += len(layer.xyz)
+        if count != len(frozen_colors):
+            raise ValueError("Frozen-color prefix must end on a layer boundary")
+        if bundle.appearance.enabled and (
+            any(parameter.requires_grad for parameter in bundle.appearance.mlp.parameters())
+            or (image_embedding is not None and image_embedding.requires_grad)
+        ):
+            raise ValueError("Color caching requires frozen appearance")
     if bundle.appearance.enabled:
         gaussian_embeddings = bundle.appearance.embeddings_for_levels(n_levels)
         if int(gaussian_embeddings.shape[0]) != int(xyz.shape[0]):
@@ -111,11 +140,12 @@ def render_lod_appearance(
             camera.camera_center,
             image_embedding,
             bundle.sh_degree,
+            frozen_colors=frozen_colors,
         )
     else:
         colors = appearance_colors_lod(
             xyz, data["sh"], xyz.new_zeros((xyz.shape[0], 1)), bundle.appearance,
-            camera.camera_center, None, bundle.sh_degree,
+            camera.camera_center, None, bundle.sh_degree, frozen_colors=frozen_colors,
         )
 
     screen = torch.zeros_like(xyz, requires_grad=True)

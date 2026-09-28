@@ -54,15 +54,13 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from .stages import capture_stage, validate_next_stage, validate_stage_records, validate_stage_use
 
-if TYPE_CHECKING:  # duck-typed contract object; never imported at runtime
-    from .camera import Camera
 
 __all__ = ["GaussianLayer", "GaussianLoD"]
 
@@ -1318,6 +1316,7 @@ class GaussianLoD(nn.Module):
         min_opacity: float = 0.005,
         scene_extent: float = 1.0,
         percent_dense: float = 0.01,
+        split_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, int]:
         """Graph-aware densification driven by screen-space gradients.
 
@@ -1367,6 +1366,8 @@ class GaussianLoD(nn.Module):
             min_opacity: prune threshold on sigmoid opacity, in [0, 1).
             scene_extent: scene size for the split/clone size decision (> 0).
             percent_dense: split size threshold as a fraction of it (>= 0).
+            split_mask: optional per-model-row boolean split decision from observed
+                projected footprints; otherwise use the scene-unit size threshold.
 
         Returns:
             ``{}`` when nothing changed; otherwise a JSON-serializable dict
@@ -1417,10 +1418,15 @@ class GaussianLoD(nn.Module):
         fixed_clone: List[Optional[torch.Tensor]] = [None] * active_idx
         act_split: Optional[torch.Tensor] = None
         act_clone: Optional[torch.Tensor] = None
-        all_big = torch.cat([
-            torch.exp(lid.log_scales.detach()).amax(dim=1) > size_gate
-            for lid in self.layers
-        ])
+        if split_mask is None:
+            all_big = torch.cat([
+                torch.exp(lid.log_scales.detach()).amax(dim=1) > size_gate
+                for lid in self.layers
+            ])
+        else:
+            all_big = torch.as_tensor(split_mask, device=layer.xyz.device)
+            if all_big.dtype != torch.bool or all_big.shape != (total,):
+                raise ValueError("split_mask must contain one boolean per model row")
         g = g.to(layer.xyz.device)
         candidates = torch.where((g >= threshold) & (g > 0))[0]
         candidates = candidates[torch.argsort(g[candidates], descending=True, stable=True)]

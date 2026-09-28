@@ -85,7 +85,11 @@ def _image_key(image: Image.Image | None) -> str | None:
     return digest.hexdigest()
 
 def _shared_prompt(prompt: PromptDescription) -> PromptDescription:
-    """Keep only fields that are intended to be reused across scales."""
+    """Keep only fields that are intended to be reused across scales.
+
+    ``provider``/``config`` are retained deliberately: they are the audit
+    provenance of the cached record and are never forwarded to a model.
+    """
 
     return PromptDescription(
         shared_region_description=prompt.shared_region_description,
@@ -95,6 +99,46 @@ def _shared_prompt(prompt: PromptDescription) -> PromptDescription:
         provider=prompt.provider,
         config=prompt.config,
     )
+
+
+#: Semantic shared fields a model prompt may contain, in stable order.
+SHARED_PROMPT_CONTEXT_FIELDS = (
+    "shared_region_description",
+    "visible_features",
+    "preserve_structure",
+    "uncertain_information",
+)
+
+
+def shared_prompt_context(
+    shared: PromptDescription | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project a shared description onto the fields a model prompt may carry.
+
+    A cached shared description is a full audit record: it keeps ``provider``,
+    ``config`` (model file inventory, interpreter, raw VLM response) and the
+    cache keys.  Feeding that record back into the model prompt makes the model
+    echo the metadata and truncate the answer, so every prompt boundary must go
+    through this single projection instead of re-filtering by hand.
+
+    Audit metadata stays available in the returned descriptions and in the
+    cache records; only the model-visible semantics are projected here.
+    """
+
+    if shared is None or (isinstance(shared, Mapping) and not shared):
+        return {}
+    description = (
+        shared if isinstance(shared, PromptDescription) else PromptDescription.from_dict(shared)
+    )
+    context: dict[str, Any] = {}
+    description_text = description.shared_region_description.strip()
+    if description_text:
+        context["shared_region_description"] = description_text
+    for key in SHARED_PROMPT_CONTEXT_FIELDS[1:]:
+        values = tuple(item for item in getattr(description, key) if str(item).strip())
+        if values:
+            context[key] = [str(item) for item in values]
+    return context
 
 
 class FixedPromptProvider:
@@ -309,7 +353,7 @@ class PromptManager:
             zoom_image,
             zoom_factor=zoom_factor,
             level_index=level_index,
-            context={**(context or {}), "shared_prompt": shared.to_dict() if shared else {}},
+            context={**(context or {}), "shared_prompt": shared_prompt_context(shared)},
         )
         if shared is not None:
             prompt = replace(
@@ -342,4 +386,6 @@ __all__ = [
     "PromptCache",
     "PromptManager",
     "PromptProvider",
+    "SHARED_PROMPT_CONTEXT_FIELDS",
+    "shared_prompt_context",
 ]

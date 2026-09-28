@@ -383,6 +383,9 @@ def apply_stage1_cfg_to_args(args: argparse.Namespace, stage1_cfg: Namespace) ->
         "data_device",
         "kernel_size",
         "eval",
+        # Which rasterizer kernel the Stage1 run was trained with; downstream
+        # renders keep using it instead of silently reverting to diff_gauss.
+        "rasterizer_backend",
         "ray_jitter",
         "resample_gt_image",
         "load_allres",

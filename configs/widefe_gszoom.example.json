@@ -1,0 +1,66 @@
+{
+  "source_path": "../../datasets/JAX_068",
+  "output_dir": "../../runs/jax068_widefe_gszoom",
+  "base_checkpoint": null,
+  "base_iterations": 30000,
+  "python": "python",
+  "vlm_python": "../../envs/qwen3vl/bin/python",
+  "dloral_python": "../../envs/dloral/bin/python",
+  "flux_model_path": "../../weights/FLUX.1-dev",
+  "vlm_model_path": "../../weights/Qwen3-VL-4B-Instruct",
+  "dloral_root": "../submodules/DLoRAL",
+  "dloral_sd_path": "../../weights/dloral/stable-diffusion-2-1-base",
+  "dloral_ckpt": "../../weights/dloral/model_enhanced.pkl",
+  "dloral_spynet": "../../weights/dloral/spynet_20210409-c6c1bd09.pth",
+  "gpu_indices": [0],
+  "lock_dir": "../../shared-gpu-locks",
+  "idle_seconds": 60,
+  "poll_seconds": 10,
+  "min_free_mib": 40000,
+  "max_utilization": 5,
+  "elevations": [85, 75, 65, 55, 45],
+  "radii": [300, 275, 275, 250, 250],
+  "grid_size": 3,
+  "grid_width": 512,
+  "grid_height": 512,
+  "cameras_per_target": 6,
+  "samples_per_pose": 2,
+  "raster": 1024,
+  "fov": 60,
+  "idu_steps_per_episode": 10000,
+  "flowedit_images_per_shard": 18,
+  "sr_views_per_shard": 6,
+  "sampler": {
+    "n_min": 4,
+    "n_max": 10,
+    "n_max_end": null,
+    "steps": 28,
+    "n_avg": 1,
+    "src_guidance": 1.5,
+    "tar_guidance": 5.5
+  },
+  "lod": {
+    "1": {
+      "steps": 10800,
+      "max_points": 800000,
+      "densify_until": 6480,
+      "densify_every": 250,
+      "checkpoints": [2700, 5400, 10800]
+    },
+    "2": {
+      "steps": 43200,
+      "max_points": 2000000,
+      "densify_until": 25920,
+      "densify_every": 500,
+      "checkpoints": [10800, 21600, 43200]
+    }
+  },
+  "lod_loss": {
+    "mode": "frequency",
+    "detail_weight": 24,
+    "lr_anchor_weight": 1,
+    "geometry_weight": 0.05,
+    "dssim_weight": 0.2,
+    "mix_ratio": 0.2
+  }
+}

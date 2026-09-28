@@ -931,7 +931,7 @@ def feature_diagnostics(
     aligned: torch.Tensor,
     fused: torch.Tensor,
     valid_mask: torch.Tensor,
-) -> dict[str, float]:
+) -> dict[str, float | bool | None]:
     """Compare target / aligned / fused features on valid vs invalid pixels."""
 
     mask = valid_mask
@@ -941,20 +941,21 @@ def feature_diagnostics(
         mask = mask.unsqueeze(0)
     mask = mask.expand_as(target)
     invalid = ~mask
-    def _l1(a, b, select) -> float:
+    def _l1(a, b, select) -> float | None:
         if not bool(select.any()):
-            return float("nan")
+            return None
         return float((a - b).abs()[select].mean().item())
+    aligned_valid_l1 = _l1(aligned, target, mask)
 
     return {
         "target_abs_mean": float(target.abs().mean().item()),
         "aligned_abs_mean": float(aligned.abs().mean().item()),
         "fused_abs_mean": float(fused.abs().mean().item()),
-        "aligned_target_l1_valid": _l1(aligned, target, mask),
+        "aligned_target_l1_valid": aligned_valid_l1,
         "aligned_target_l1_invalid": _l1(aligned, target, invalid),
         "fused_target_l1_valid": _l1(fused, target, mask),
         "fused_target_l1_invalid": _l1(fused, target, invalid),
-        "aligned_changes_valid": _l1(aligned, target, mask) > 1e-6,
+        "aligned_changes_valid": aligned_valid_l1 is not None and aligned_valid_l1 > 1e-6,
         "coverage": float(valid_mask.float().mean().item()) if valid_mask.numel() else 0.0,
         "has_nan": bool(torch.isnan(target).any() or torch.isnan(aligned).any() or torch.isnan(fused).any()),
     }

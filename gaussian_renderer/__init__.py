@@ -12,9 +12,25 @@
 import torch
 import math
 from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
-# from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from lod.rasterizer import require_rade_gs
+from arguments import RASTERIZER_BACKENDS
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+
+
+def _resolve_rasterizer_backend(pipe) -> str:
+    """Backend of the rasterizer kernel for this render call.
+
+    Defaults to ``diff_gauss`` so callers that build their own pipe object
+    (GUI, tests, minimal wrappers) keep the original Skyfall behavior.
+    """
+
+    backend = getattr(pipe, "rasterizer_backend", "diff_gauss")
+    if backend not in RASTERIZER_BACKENDS:
+        raise ValueError(
+            f"Unknown rasterizer_backend={backend!r}; expected one of {list(RASTERIZER_BACKENDS)}"
+        )
+    return backend
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, override_color = None, subpixel_offset=None, testing=False, appearance_embedding=None):
     """
@@ -34,27 +50,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    if subpixel_offset is None:
-        subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
-        
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        subpixel_offset=subpixel_offset,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
@@ -128,36 +123,86 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity.float(),
-        scales = scales.float(),
-        rotations = rotations,
-        cov3Ds_precomp = cov3D_precomp) # For diff_gauss
-    # rendered_image, radii = rasterizer(
-    #     means3D = means3D,
-    #     means2D = means2D,
-    #     shs = shs,
-    #     colors_precomp = colors_precomp,
-    #     opacities = opacity.float(),
-    #     scales = scales.float(),
-    #     rotations = rotations,
-    #     cov3D_precomp = cov3D_precomp) # For mip-splatting orignal
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    # Backend dispatch: ``diff_gauss`` is the original Skyfall kernel,
+    # ``rade`` routes through the official RaDe-GS diff_gaussian_rasterization.
+    # Both share the SH/appearance color computation above, the 3D-filtered
+    # opacity/scales and the viewspace gradient hook; only the kernel call
+    # differs.
+    backend = _resolve_rasterizer_backend(pipe)
+    if backend == "rade":
+        # The RaDe-GS kernel has no subpixel-offset input; jittered SSAA
+        # sampling is a diff_gauss-only feature and fails loudly instead of
+        # silently ignoring the offset.
+        if subpixel_offset is not None and bool(subpixel_offset.any()):
+            raise ValueError(
+                "subpixel_offset (ray_jitter/SSAA) is not supported by the 'rade' "
+                "rasterizer backend; pass subpixel_offset=None or select 'diff_gauss'."
+            )
+        settings_cls, rasterizer_cls = require_rade_gs()
+        raster_settings = settings_cls(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            kernel_size=kernel_size,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            require_depth=True,
+            debug=pipe.debug
+        )
+        rendered_image, radii, rendered_depth, rendered_median_depth, rendered_alpha, rendered_norm = rasterizer_cls(raster_settings)(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = opacity.float(),
+            scales = None if scales is None else scales.float(),
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp) # For RaDe-GS
+        extra = None
+    else:
+        if subpixel_offset is None:
+            subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
 
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    # return {"render": rendered_image,
-    #         "viewspace_points": screenspace_points,
-    #         "visibility_filter" : radii > 0,
-    #         "radii": radii}
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            kernel_size=kernel_size,
+            subpixel_offset=subpixel_offset,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=pipe.debug
+        )
+
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+        rendered_image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = opacity.float(),
+            scales = scales.float(),
+            rotations = rotations,
+            cov3Ds_precomp = cov3D_precomp) # For diff_gauss
+        rendered_median_depth = None
     return {"render": rendered_image,
             "render_depth": rendered_depth,
             "render_norm": rendered_norm,
             "render_alpha": rendered_alpha,
+            "render_median_depth": rendered_median_depth,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,

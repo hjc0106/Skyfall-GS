@@ -11,6 +11,8 @@
 
 import os
 import sys
+import stat
+import uuid
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -146,7 +148,25 @@ def storePly(path, xyz, rgb):
     # Create the PlyData object and write to file
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
-    ply_data.write(path)
+    # plyfile readers may memory-map this cache. Never truncate the inode
+    # another scene loader is reading; publish a complete replacement instead.
+    target = Path(path).resolve()
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            try:
+                os.fchmod(stream.fileno(), stat.S_IMODE(target.stat().st_mode))
+            except FileNotFoundError:
+                pass
+            ply_data.write(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 def readColmapSceneInfo(path, images, eval, llffhold=8):
     try:

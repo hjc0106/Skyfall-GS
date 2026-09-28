@@ -17,12 +17,15 @@ Recipe provenance (remote project, branch dev-stage2-gaussianzoom):
     ``transforms_train.json`` is resolved at preflight).
   * NYC Stage 1: ``scripts/run_nyc.py`` (``--target_std 32``, grad threshold
     0.0002, opacity reset 4000).
-  * JAX Stage 2: ``scripts/run_jax_idu.py`` with the verified JAX-068 settings
+  * JAX Stage 2 spatial/optimization recipe: original ``scripts/run_jax_idu.py``
     (``idu_grid_size 3``, ``lambda_pseudo_depth 0.5``, ``idu_num_cams 6``,
     ``idu_num_samples_per_view 2``, ``idu_episode_iterations 10000``,
     ``idu_densify_until_iter 9000``, ``idu_train_ratio 0.75``).
-  * NYC Stage 2: ``scripts/run_nyc_idu.py`` (``idu_grid_size 4``,
-    ``lambda_pseudo_depth 0.0``, ``lambda_opacity 10``, ``--target_std 32``).
+  * NYC Stage 2 spatial/optimization recipe: original ``scripts/run_nyc_idu.py``
+    (``idu_grid_size 4``, ``lambda_pseudo_depth 0.0``, ``lambda_opacity 10``, ``--target_std 32``).
+
+This frozen queue explicitly uses GaussianZoom synthesis. The generic IDU
+default and the current JAX/NYC launchers instead select pure FlowEdit.
 
 The five-elevation course and 10000-step episodes come from
 ``arguments/__init__.py`` (``jax_v1`` / ``nyc_v1``) and are untouched.  The
@@ -159,7 +162,7 @@ STAGE1_NYC_ARGS = [
     "--checkpoint_iterations", str(STAGE1_ITERATIONS),
 ]
 
-# JAX Stage 2 == scripts/run_jax_idu.py + verified JAX-068 run_status parameters.
+# Shared JAX Stage 2 spatial/optimization recipe; backend selected by caller.
 STAGE2_JAX_ARGS = [
     "--iterative_datasets_update",
     "--kernel_size", "0.1",
@@ -186,7 +189,7 @@ STAGE2_JAX_ARGS = [
     "--idu_seed", "0",
 ]
 
-# NYC Stage 2 == scripts/run_nyc_idu.py.
+# Shared NYC Stage 2 spatial/optimization recipe; backend selected by caller.
 STAGE2_NYC_ARGS = [
     "--iterative_datasets_update",
     "--kernel_size", "0.1",
@@ -381,6 +384,10 @@ def build_jobs(project: Path, run_root: Path, only: list, stages: list) -> list:
 def job_command(job: dict, project: Path, source_path: Path, start_checkpoint: str | None,
                 compact: bool = True) -> list:
     args = list(RECIPES[(job["stage"], job["recipe"])])
+    if job["stage"] == "stage2":
+        # This queue publishes gaussianzoom_stage2 markers; never inherit a
+        # different backend when the generic train.py default changes.
+        args += ["--idu_refine_backend", "gaussianzoom"]
     if compact:
         args += COMPACT_ARGS
     command = [os.environ.get("SKYFALL_PYTHON", ENV_DEFAULTS["SKYFALL_PYTHON"]), "-u",

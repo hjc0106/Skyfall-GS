@@ -248,3 +248,23 @@ __marimo__/
 /submodules/DLoRAL/preset_models/
 /submodules/DLoRAL/preset/models/
 /submodules/diff-gaussian-rasterization/third_party/
+
+# Training artifacts and local control state are never source dependencies.
+/runs/
+/datasets/
+/model-cache/
+/checkpoints/
+/find_view/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.pkl
+*.ply
+*.mp4
+*.webm
+*.mov
+*.npy
+*.npz
+.env.*
+.training.lock

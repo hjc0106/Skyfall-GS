@@ -238,8 +238,9 @@ def load_standard_ply(gaussians: GaussianModel, path: str):
                     np.asarray(plydata.elements[0]["z"])),  axis=1)
     opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
-    # Set default filter_3D values (no anti-aliasing filter)
-    filter_3D = np.ones((xyz.shape[0], 1))  # Default to 1.0 (no filtering)
+    # Standard/fused PLY stores the effective scales and opacity already.
+    # Zero is the neutral additional filter; one would blur it again.
+    filter_3D = np.zeros((xyz.shape[0], 1), dtype=np.float32)
 
     features_dc = np.zeros((xyz.shape[0], 3, 1))
     features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -279,17 +280,15 @@ def load_standard_ply(gaussians: GaussianModel, path: str):
 
     gaussians.active_sh_degree = gaussians.max_sh_degree
 
-def render_set_from_ply(ply_path, camera_path_name, views, pipeline, background, kernel_size, scale_factor, depth, sh_degree=None, cameras=None):
+def render_set_from_ply(ply_path, camera_path_name, views, pipeline, background, kernel_size, scale_factor, depth, sh_degree=None):
     imgs = []
 
     # Load Gaussians from PLY
     print(f"Loading Gaussians from PLY: {ply_path}")
     gaussians = load_ply_gaussians(ply_path, sh_degree=sh_degree)
 
-    # Compute 3D filter if cameras are provided (this is key for proper Mip-Splatting rendering)
-    if cameras is not None:
-        print("Computing 3D filter from camera parameters...")
-        gaussians.compute_3D_filter(cameras)
+    # Keep a saved filter, or the neutral filter for a fused/standard PLY.
+    # A new rendering trajectory must not change the model's physical footprint.
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if not depth:
@@ -305,7 +304,9 @@ def render_set_from_ply(ply_path, camera_path_name, views, pipeline, background,
 class PipelineParams:
     """Minimal pipeline parameters for rendering."""
     def __init__(self):
-        self.convert_SHs_python = False
+        # Match the trained appearance path: evaluate published SH in PyTorch
+        # and pass RGB to the rasterizer, retaining view-dependent appearance.
+        self.convert_SHs_python = True
         self.compute_cov3D_python = False
         self.debug = False
 
@@ -370,7 +371,7 @@ def render_video_from_ply(ply_path: str, camera_path: str, output_path: str = No
     cam_infos = cameraList_from_camInfos(cams, 1.0, minimal_args, is_testing=True)
 
     # Render frames
-    imgs = render_set_from_ply(ply_path, camera_path_name, cam_infos, pipeline, background, kernel_size, 1.0, depth, sh_degree, cameras=cam_infos)
+    imgs = render_set_from_ply(ply_path, camera_path_name, cam_infos, pipeline, background, kernel_size, 1.0, depth, sh_degree)
 
     # Save individual frames if requested
     if save_images:
