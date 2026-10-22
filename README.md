@@ -1,3 +1,5 @@
+> **Stage 1 DSM 分支使用指南（中文）**：环境安装、数据准备、B/C 开关、A/B/C 冒烟、完整训练、恢复与评估，请阅读 [README_STAGE1_DSM.md](README_STAGE1_DSM.md)。
+
 <p align="center">
   <h1 align="center"><img src="./assets/logo.png" align="top" width="38" height="38" />&nbspSkyfall-GS: Synthesizing Immersive 3D Urban Scenes from Satellite Imagery</h1>
   <p align="center">

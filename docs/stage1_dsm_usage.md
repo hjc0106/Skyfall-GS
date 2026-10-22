@@ -1,6 +1,7 @@
 # Stage 1 DSM B/C migration
 
-Implemented on `codex/stage1-dsm-prior`, based on `main@22134e1`.
+Available on `stage1-dsm` (original implementation branch: `codex/stage1-dsm-prior`), based on `main@22134e1`.
+See the [Chinese installation and run guide](../README_STAGE1_DSM.md).
 The original dev-gszoom-v2 checkout is unchanged. No merge into main has been
 performed. Runtime code has no dependency on the ArtiFixer directory.
 
