@@ -46,7 +46,7 @@ class Scene:
         if os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             if os.path.exists(os.path.join(args.source_path, "points3D.txt")) or os.path.exists(os.path.join(args.source_path, "depths_moge")):
                 print("Found transforms_train.json and points3D.txt files, assuming multi-scale Satellite data set!")
-                scene_info = sceneLoadTypeCallbacks["Satellite"](args.source_path, args.white_background, args.eval)
+                scene_info = sceneLoadTypeCallbacks["Satellite"](args.source_path, args.white_background, args.eval, model_args=args)
             else:
                 print("Found transforms_train.json file, assuming Blender data set!")
                 scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -58,9 +58,29 @@ class Scene:
         else:
             assert False, "Could not recognize scene type!"
 
+        if not self.loaded_iter and getattr(args, 'init_max_points', 0):
+            import numpy as np
+            from utils.graphics_utils import BasicPointCloud
+            count = int(args.init_max_points)
+            if count < 1:
+                raise ValueError('init_max_points must be positive or 0 for no limit')
+            cloud = scene_info.point_cloud
+            if len(cloud.points) > count:
+                indices = np.sort(np.random.default_rng(args.dsm_seed).choice(len(cloud.points), count, replace=False))
+                cloud = BasicPointCloud(*(values[indices] for values in cloud))
+                meta = scene_info.dsm_meta
+                if meta is not None:
+                    meta = dict(meta)
+                    for key in ('confidence', 'anchor_id', 'is_dsm', 'rotations'):
+                        meta[key] = meta[key][indices]
+                scene_info = scene_info._replace(point_cloud=cloud, dsm_meta=meta)
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())
+            if scene_info.dsm_meta is not None or getattr(args, 'init_max_points', 0):
+                from scene.dataset_readers import storePly
+                storePly(os.path.join(self.model_path, 'input.ply'), scene_info.point_cloud.points,
+                         scene_info.point_cloud.colors * 255)
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
@@ -97,12 +117,17 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
+            state = os.path.join(ply_path or self.model_path, 'point_cloud',
+                                 'iteration_' + str(self.loaded_iter), 'dsm_state.npz')
+            if os.path.exists(state):
+                self.gaussians.load_dsm_state(state)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, scene_info.dsm_meta)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_dsm_state(os.path.join(point_cloud_path, "dsm_state.npz"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

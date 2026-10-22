@@ -377,3 +377,12 @@ If you find this work useful, please consider citing:
 ## License
 
 This project is licensed under the terms of the [Apache 2 License](LICENSE).
+
+
+## Stage 1 with a DSM prior
+
+Stage 1 supports DSM mixed initialization and an optional surface constraint.
+Supplying `--dsm_prior PATH` enables the mixed initializer and the surface loss
+by default (C); add `--no_dsm_surface` for initialization only (B). Without a
+prior, the SfM path is retained. See [configuration, coordinate validation, tests
+and portable A/B/C commands](docs/stage1_dsm_usage.md).

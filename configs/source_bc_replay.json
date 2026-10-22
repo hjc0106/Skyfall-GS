@@ -1,0 +1,5 @@
+{
+  "description": "Source ArtiFixer A/B/C screening settings, not full main Stage 1",
+  "iterations": 10000,
+  "arguments": ["--eval", "--resolution", "1", "--kernel_size", "0.1", "--sh_degree", "1", "--appearance_enabled", "--lambda_depth", "0", "--lambda_opacity", "0", "--lambda_pseudo_depth", "0", "--start_sample_pseudo", "1000", "--end_sample_pseudo", "21000", "--densify_until_iter", "9000", "--densify_grad_threshold", "0.0001", "--size_threshold", "100000", "--opacity_reset_interval", "4000", "--sample_pseudo_interval", "10"]
+}

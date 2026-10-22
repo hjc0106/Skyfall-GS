@@ -64,7 +64,11 @@ class ParamGroup:
             arg_names.append(f"-{clean_name[0]}")
         
         # Add argument based on type
-        if value_type == bool:
+        if clean_name == 'dsm_surface':
+            switches = group.add_mutually_exclusive_group()
+            switches.add_argument('--dsm_surface', dest=clean_name, action='store_true', default=final_default)
+            switches.add_argument('--no_dsm_surface', dest=clean_name, action='store_false')
+        elif value_type == bool:
             group.add_argument(*arg_names, default=final_default, action="store_true")
         else:
             group.add_argument(*arg_names, default=final_default, type=value_type)
@@ -117,12 +121,36 @@ class ModelParams(ParamGroup):
         self.load_allres: bool = False
         self.sample_more_highres: bool = False
         
+        self.init_max_points: int = 0
+        self.dsm_prior: str = ""
+        self.dsm_init: bool = False
+        self.dsm_init_mode: str = "replace_budgeted"
+        self.dsm_surface_thresh: float = 3.0
+        self.dsm_max_init_points: int = 65536
+        self.dsm_tangent_scale: float = 0.5
+        self.dsm_normal_scale: float = 0.2
+        self.dsm_clone_conf_scale: float = 0.5
+        self.dsm_seed: int = 0
         super().__init__(parser, "Loading Parameters", sentinel)
     
     def extract(self, args: Namespace) -> GroupParams:
         """Extract parameters and convert source_path to absolute path."""
         group = super().extract(args)
         group.source_path = str(Path(group.source_path).resolve())
+        for key, default in vars(self).items():
+            if key.startswith('dsm_') and getattr(group, key, None) is None:
+                setattr(group, key, default)
+        if group.dsm_prior:
+            group.dsm_prior = str(Path(group.dsm_prior).resolve())
+            if not Path(group.dsm_prior).is_file():
+                raise FileNotFoundError(group.dsm_prior)
+            group.dsm_init = True
+        elif group.dsm_init:
+            raise ValueError('--dsm_init requires --dsm_prior')
+        if group.dsm_init_mode != 'replace_budgeted':
+            raise ValueError('Only the source B/C replace_budgeted initializer is supported')
+        if group.dsm_max_init_points <= 0 or min(group.dsm_tangent_scale, group.dsm_normal_scale) <= 0:
+            raise ValueError('DSM point limit and scales must be positive')
         return group
 
 
@@ -213,6 +241,14 @@ class OptimizationParams(ParamGroup):
         # Post-training
         self.post_training_iterations: int = 500
         
+        self.dsm_surface: bool = True
+        self.lambda_dsm_surface: float = 0.05
+        self.dsm_surface_sigma: float = 0.5
+        self.dsm_surface_sample: int = 65536
+        self.dsm_warmup_iters: int = 500
+        self.dsm_hold_iters: int = 5000
+        self.dsm_decay_iters: int = 21000
+        self.dsm_late_scale: float = 0.2
         super().__init__(parser, "Optimization Parameters")
     
     def _init_idu_params(self):

@@ -32,10 +32,10 @@ from utils.camera_utils import gen_idu_orbit_camera, cameraList_from_camInfos
 from scene.dataset_readers import CameraInfo
 
 from PIL import Image
-from submodules.MoGe.idu_depth import MoGeIDU
+
 
 # pip install diffusers==0.30.1 huggingface-hub==0.33.4 transformers==4.46.3 tokenizers==0.20.3 (default)
-from submodules.FlowEdit.idu_refine import FlowEditRefineIDU 
+
 
 # fused SSIM, for faster training
 
@@ -54,12 +54,25 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-os.makedirs("./depth_tmp", exist_ok=True)
-moge_standalone = MoGeIDU(
-    "./depth_tmp",
-    "cuda:0",
-    60.0
-)
+from utils.dsm_prior import try_load_dsm_prior, add_dsm_losses
+from utils.dsm_checkpoint import capture_stage1, restore_configuration, restore_aux
+
+_moge_standalone = None
+
+def MoGeIDU(*args, **kwargs):
+    from submodules.MoGe.idu_depth import MoGeIDU as implementation
+    return implementation(*args, **kwargs)
+
+def FlowEditRefineIDU(*args, **kwargs):
+    from submodules.FlowEdit.idu_refine import FlowEditRefineIDU as implementation
+    return implementation(*args, **kwargs)
+
+def get_moge_standalone():
+    global _moge_standalone
+    if _moge_standalone is None:
+        os.makedirs('./depth_tmp', exist_ok=True)
+        _moge_standalone = MoGeIDU('./depth_tmp', 'cuda:0', 60.0)
+    return _moge_standalone
 
 @torch.no_grad()
 def create_offset_gt(image, offset):
@@ -84,6 +97,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lpips_loss_fn.cuda()
         print("Initialized LPIPS loss")
     first_iter = 0
+    checkpoint_model = None
+    resumed_new = False
+    if checkpoint:
+        checkpoint_model, first_iter = torch.load(checkpoint, weights_only=False)
+        flags = {value.split('=')[0] for value in sys.argv[1:]}
+        overrides = {}
+        if flags & {'--dsm_surface', '--no_dsm_surface'}:
+            overrides['dsm_surface'] = opt.dsm_surface
+        if '--lambda_dsm_surface' in flags:
+            overrides['lambda_dsm_surface'] = opt.lambda_dsm_surface
+        resumed_new = restore_configuration(checkpoint_model, dataset, opt, overrides)
+    if opt.dsm_surface_sigma <= 0 or opt.dsm_surface_sample <= 0 or opt.lambda_dsm_surface < 0:
+        raise ValueError('Invalid DSM surface coefficient, sigma or sample count')
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(
         dataset.sh_degree,
@@ -92,20 +118,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dataset.appearance_embedding_dim
     )
     scene = Scene(dataset, gaussians)
+    dsm_prior = try_load_dsm_prior(dataset)
     gaussians.training_setup(opt, num_train_cameras=len(scene.getTrainCameras()))
     if checkpoint:
         print("Restoring model from checkpoint")
         # original implementation
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
-        # set correct xyz lr scheduler
-        opt.position_lr_max_steps = opt.iterations
-        opt.densify_until_iter = opt.iterations
-        opt.densify_from_iter = 0
-        gaussians.xyz_scheduler_args = get_expon_lr_func(lr_init=opt.position_lr_init * gaussians.spatial_lr_scale,
-                                                        lr_final=opt.position_lr_final * gaussians.spatial_lr_scale,
-                                                        lr_delay_mult=opt.position_lr_delay_mult,
-                                                        max_steps=opt.position_lr_max_steps)
+        gaussians.restore(checkpoint_model, opt)
+        if not resumed_new:
+            # Legacy checkpoint resume behavior.
+            opt.position_lr_max_steps = opt.iterations
+            opt.densify_until_iter = opt.iterations
+            opt.densify_from_iter = 0
+            gaussians.xyz_scheduler_args = get_expon_lr_func(lr_init=opt.position_lr_init * gaussians.spatial_lr_scale,
+                                                            lr_final=opt.position_lr_final * gaussians.spatial_lr_scale,
+                                                            lr_delay_mult=opt.position_lr_delay_mult,
+                                                            max_steps=opt.position_lr_max_steps)
         print("Restored model from checkpoint at iteration {}".format(first_iter))
 
 
@@ -139,6 +166,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     opacity_cooldown_iter = None
     origin_lambda_opacity = opt.lambda_opacity
+    events = dict(finite_loss_steps=0, finite_gradient_steps=0, densification_calls=0, cloned=0, split_added=0, pruned=0, opacity_resets=0)
+    if resumed_new:
+        restore_aux(checkpoint_model, gaussians)
+        runtime = checkpoint_model['runtime']
+        events = runtime['events']
+        viewpoint_stack = [trainCameras[i] for i in runtime['viewpoint_uids']] if runtime['viewpoint_uids'] is not None else None
+        pseudo_stack = runtime['pseudo_stack']
+        opacity_cooldown_iter = runtime['opacity_cooldown_iter']
+        origin_lambda_opacity = runtime['origin_lambda_opacity']
+    effective = bool(dsm_prior is not None and opt.dsm_surface and opt.lambda_dsm_surface > 0)
+    if effective and not (gaussians.dsm_confidence > 0).any():
+        raise ValueError('Enabled DSM surface loss has no constrained Gaussian points')
+    config = {'initialization': 'dsm_mixed' if dsm_prior else 'sfm',
+              'surface_requested': opt.dsm_surface, 'surface_effective': effective,
+              'surface_lambda': opt.lambda_dsm_surface if effective else 0.0,
+              'prior_points': int((gaussians.dsm_confidence > 0).sum()),
+              'dataset': vars(dataset), 'optimization': vars(opt),
+              'evaluation_protocol': 'controlled_same_dsm' if dsm_prior else 'sfm_baseline'}
+    with open(os.path.join(scene.model_path, 'stage1_config.json'), 'w') as handle:
+        import json
+        json.dump(config, handle, indent=2, default=vars)
+    print('Stage1 DSM:', {key: config[key] for key in ('initialization', 'surface_requested', 'surface_effective', 'prior_points')})
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -264,7 +313,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
             
             render_image_pil = to_pil_image(render_image)
-            moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
+            moge_depth = get_moge_standalone().run([render_image_pil], pbar=False)[0]
             gt_depth = torch.tensor(moge_depth).to(render_depth.device)
 
             gt_depth = gt_depth.reshape(-1, 1)
@@ -276,7 +325,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss += loss_scale * opt.lambda_pseudo_depth * depth_loss_pseudo
                 depth_loss += depth_loss_pseudo
 
+        loss, dsm_logs = add_dsm_losses(loss, gaussians, dsm_prior, opt, iteration)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f'Nonfinite loss at step {iteration}: RGB_L1={float(Ll1.detach())}, opacity={opacity_loss}, DSM={dsm_logs}')
+        events['finite_loss_steps'] += 1
         loss.backward()
+        if getattr(args, 'verify_finite_gradients', False):
+            for group in gaussians.optimizer.param_groups:
+                for parameter in group['params']:
+                    if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+                        raise FloatingPointError(f'Nonfinite gradient at step {iteration}')
+            events['finite_gradient_steps'] += 1
+        if tb_writer:
+            for key, value in dsm_logs.items():
+                tb_writer.add_scalar('dsm/' + key, value, iteration)
 
         iter_end.record()
 
@@ -318,11 +380,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     # size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     size_threshold = opt.size_threshold
                     # size_threshold = None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    cloned, split_added, pruned = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    events['densification_calls'] += 1
+                    events['cloned'] += int(cloned)
+                    events['split_added'] += int(split_added)
+                    events['pruned'] += int(pruned)
                     gaussians.compute_3D_filter(cameras=trainCameras) # + pseudoCameras)
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                    events['opacity_resets'] += 1
                     opt.lambda_opacity = 0.01
                     opacity_cooldown_iter = 500
                     print(f"Turn off opacity regularization for {opacity_cooldown_iter} iterations")
@@ -341,11 +408,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                runtime = {'viewpoint_uids': [camera.uid for camera in viewpoint_stack] if viewpoint_stack is not None else None,
+                           'pseudo_stack': pseudo_stack, 'opacity_cooldown_iter': opacity_cooldown_iter,
+                           'origin_lambda_opacity': origin_lambda_opacity, 'events': events}
+                torch.save((capture_stage1(gaussians, dataset, opt, runtime), iteration),
+                           scene.model_path + '/chkpnt' + str(iteration) + '.pth')
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                with open(os.path.join(scene.model_path, 'stage1_events.json'), 'w') as handle:
+                    json.dump({'iteration': iteration, 'events': events, 'prior_alignment': True,
+                               'surface_active_points': int(dsm_logs.get('dsm_active_points', 0)),
+                               'resumed': resumed_new}, handle, indent=2)
+            if getattr(args, 'stop_after_iteration', 0) == iteration:
+                if iteration not in checkpoint_iterations:
+                    raise ValueError('stop_after_iteration must be a checkpoint iteration')
+                print(f'Paused at checkpoint {iteration}; training schedule retained')
+                break
 
 @torch.no_grad()
 def render_idu_set(views, gaussians, pipeline, background, kernel_size, idu_random_ap=False):
@@ -819,7 +899,7 @@ def training_idu_episode(
             render_image, render_depth = render_pkg["render"], render_pkg["render_depth"]
             
             render_image_pil = to_pil_image(render_image)
-            moge_depth = moge_standalone.run([render_image_pil], pbar=False)[0]
+            moge_depth = get_moge_standalone().run([render_image_pil], pbar=False)[0]
             gt_depth = torch.tensor(moge_depth).to(render_depth.device)
 
             gt_depth = gt_depth.reshape(-1, 1)
@@ -1113,6 +1193,10 @@ if __name__ == "__main__":
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000, 3050, 7_000, 10000, 15000, 20000, 21000, 22000, 23000, 30_000, 60100, 61000, 62000, 65000, 67500, 70000, 70100, 71000, 72000, 75000, 77500, 80000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[2000, 3050, 7_000, 10000, 15000, 20000, 21000, 22000, 23000, 30_000, 60100, 61000, 62000, 65000, 67500, 70000, 70100, 71000, 72000, 75000, 77500, 80000])
+    parser.add_argument('--verify_finite_gradients', action='store_true')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--stop_after_iteration', type=int, default=0,
+                        help='Pause after saving a scheduled checkpoint; keep the full training schedule')
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[2000, 3050, 7_000, 10000, 15000, 20000, 21000, 22000, 23000, 30_000, 60100, 61000, 62000, 65000, 67500, 70000, 70000, 70100, 71000, 72000, 75000, 77500, 80000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -1124,6 +1208,9 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)

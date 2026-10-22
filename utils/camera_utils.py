@@ -49,8 +49,10 @@ def loadCam(args, id, cam_info, resolution_scale, is_testing=False, optimizing=F
         depth = mask = None
         if cam_info.depth is not None:
             depth = torch.tensor(cam_info.depth).unsqueeze(0)
+            depth = torch.nn.functional.interpolate(depth.unsqueeze(0).float(), size=resolution[::-1], mode='nearest')[0]
         if cam_info.mask is not None:
             mask = torch.tensor(cam_info.mask).unsqueeze(0)
+            mask = torch.nn.functional.interpolate(mask.unsqueeze(0).float(), size=resolution[::-1], mode='nearest')[0]
 
         gt_image = resized_image_rgb[:3, ...]
         loaded_mask = None

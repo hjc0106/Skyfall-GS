@@ -47,6 +47,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    dsm_meta: object = None
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -357,7 +358,7 @@ def readMultiScaleNerfSyntheticInfo(path, white_background, eval, load_allres=Fa
                            ply_path=ply_path)
     return scene_info
 
-def readSatelliteInfo(path, white_background, eval, extension=".png"):
+def readSatelliteInfo(path, white_background, eval, extension=".png", model_args=None):
     print("Reading Training Transforms")
     train_cam_infos, R, T = readSatelliteCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
@@ -461,7 +462,8 @@ def readSatelliteInfo(path, white_background, eval, extension=".png"):
             print("No rotation matrix found, skipping normalization")
             nerf_normalization = {"translate": np.array([0.0, 0.0, 0.0]), "radius": 128.0}
         print(f"Nerf Normalization: {nerf_normalization}")
-        storePly(ply_path, xyz, rgb)
+        if not os.path.exists(ply_path):
+            storePly(ply_path, xyz, rgb)
     except Exception as e:
         print(f"Error converting point3D.txt to .ply: {e}")
 
@@ -478,17 +480,26 @@ def readSatelliteInfo(path, white_background, eval, extension=".png"):
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         print("Loading point cloud from", ply_path)
-        pcd = fetchPly(ply_path)
+        if 'xyz' in locals() and 'rgb' in locals():
+            pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0, normals=np.zeros_like(xyz))
+        else:
+            pcd = fetchPly(ply_path)
         # print number of points
         print(f"Number of points in the point cloud: {len(pcd.points)}")
     except Exception:
         pcd = None
 
+    dsm_meta = None
+    if model_args is not None and getattr(model_args, 'dsm_prior', ''):
+        if R is not None:
+            raise ValueError('Registered DSM prior requires the same training frame; R/T-normalized datasets need an explicitly transformed prior')
+        from utils.dsm_prior import mix_init_with_dsm
+        pcd, dsm_meta = mix_init_with_dsm(pcd, model_args.dsm_prior, train_cam_infos, model_args)
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path, dsm_meta=dsm_meta)
     return scene_info
 
 def readSatelliteCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):

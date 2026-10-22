@@ -1,0 +1,6 @@
+# Install after the base Skyfall-GS environment and CUDA extensions.
+numpy
+scipy
+Pillow
+tifffile
+pytest

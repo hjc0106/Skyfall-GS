@@ -31,7 +31,9 @@ C0 = 0.28209479177387814
 def _get_fourier_features(xyz: Tensor, num_features=3):
     xyz = torch.from_numpy(xyz).to(dtype=torch.float32)
     xyz = xyz - xyz.mean(dim=0, keepdim=True)
-    xyz = xyz / torch.quantile(xyz.abs(), 0.97, dim=0) * 0.5 + 0.5
+    # A flat DSM can have zero spread along an axis; keep its embedding finite.
+    spread = torch.quantile(xyz.abs(), 0.97, dim=0).clamp_min(torch.finfo(xyz.dtype).eps)
+    xyz = xyz / spread * 0.5 + 0.5
     freqs = torch.repeat_interleave(
         2**torch.linspace(0, num_features-1, num_features, dtype=xyz.dtype, device=xyz.device), 2)
     offsets = torch.tensor([0, 0.5 * math.pi] * num_features, dtype=xyz.dtype, device=xyz.device)
@@ -123,6 +125,9 @@ class GaussianModel:
             self.appearance_embeddings = None
             self.appearance_mlp = None
 
+        self.dsm_confidence = torch.empty(0)
+        self.dsm_anchor_id = torch.empty(0, dtype=torch.long)
+        self.dsm_clone_conf_scale = 0.5
         self.setup_functions()
 
     def capture(self):
@@ -142,45 +147,20 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.dsm_confidence,
+            self.dsm_anchor_id,
         )
     
     def restore(self, model_args, training_args, iterative_datasets_update=False):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self._embeddings,
-        self.appearance_embeddings,
-        self.appearance_mlp,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        xyz_gradient_accum, denom, opt_dict = self._unpack_capture(model_args)
         self.training_setup(training_args, from_scratch=False)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)  # load optimizer state
+        self.assert_dsm_alignment()
 
     def load_from_checkpoints(self, model_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self._embeddings,
-        self.appearance_embeddings,
-        self.appearance_mlp,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self._unpack_capture(model_args)
         print("self._features_dc.shape", self._features_dc.shape)
         print("self._features_rest.shape", self._features_rest.shape)
         print("self._xyz.shape", self._xyz.shape)
@@ -311,7 +291,7 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, dsm_meta=None):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -329,6 +309,22 @@ class GaussianModel:
         # Default: 0.1
         # Satellite: 0.5
         opacities = inverse_sigmoid(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        n = fused_point_cloud.shape[0]
+        if dsm_meta is not None:
+            is_dsm = torch.tensor(dsm_meta["is_dsm"], device="cuda")
+            tang = float(dsm_meta.get("tangent_scale", 0.5))
+            nsc = float(dsm_meta.get("normal_scale", 0.2))
+            scales = scales.clone()
+            scales[is_dsm] = torch.log(torch.tensor([tang, tang, nsc], device="cuda"))
+            rots = rots.clone()
+            rots[is_dsm] = torch.tensor(dsm_meta["rotations"], device="cuda")[is_dsm]
+            self.dsm_confidence = torch.tensor(dsm_meta["confidence"], device="cuda", dtype=torch.float32)
+            self.dsm_anchor_id = torch.tensor(dsm_meta["anchor_id"], device="cuda", dtype=torch.long)
+            self.dsm_clone_conf_scale = float(dsm_meta.get("clone_conf_scale", 0.5))
+        else:
+            self.dsm_confidence = torch.zeros(n, device="cuda")
+            self.dsm_anchor_id = torch.full((n,), -1, device="cuda", dtype=torch.long)
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -545,6 +541,8 @@ class GaussianModel:
         self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
+        self.dsm_confidence = torch.zeros(len(self._xyz), device=self._xyz.device)
+        self.dsm_anchor_id = torch.full((len(self._xyz),), -1, device=self._xyz.device, dtype=torch.long)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -599,6 +597,10 @@ class GaussianModel:
         self.xyz_gradient_accum_abs_max = self.xyz_gradient_accum_abs_max[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.dsm_confidence.numel():
+            self.dsm_confidence = self.dsm_confidence[valid_points_mask]
+            self.dsm_anchor_id = self.dsm_anchor_id[valid_points_mask]
+        self.assert_dsm_alignment()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -680,6 +682,8 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_embeddings)
 
+        self._append_dsm_split(selected_pts_mask, N)
+        self.assert_dsm_alignment()
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
@@ -703,6 +707,8 @@ class GaussianModel:
             new_embeddings = None
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embeddings)
+        self._append_dsm_clone(selected_pts_mask)
+        self.assert_dsm_alignment()
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -788,4 +794,100 @@ class GaussianModel:
             print(f"Set opacity to near zero for {num_to_prune} points outside radius {radius}.")
         else:
             print(f"No points found outside radius {radius} to prune by opacity.")
-        
+
+    def _unpack_capture(self, model_args):
+        payload = model_args if isinstance(model_args, dict) else None
+        if isinstance(model_args, dict):
+            if model_args.get('stage1_dsm_version') != 1:
+                raise ValueError('Unsupported DSM checkpoint version')
+            self.dsm_clone_conf_scale = model_args['clone_conf_scale']
+            model_args = model_args['model_state']
+        if len(model_args) >= 17:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._embeddings,
+                self.appearance_embeddings,
+                self.appearance_mlp,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self.dsm_confidence,
+                self.dsm_anchor_id,
+            ) = model_args[:17]
+        else:
+            (
+                self.active_sh_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._embeddings,
+                self.appearance_embeddings,
+                self.appearance_mlp,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
+            n = self._xyz.shape[0]
+            self.dsm_confidence = torch.zeros(n, device=self._xyz.device)
+            self.dsm_anchor_id = torch.full((n,), -1, device=self._xyz.device, dtype=torch.long)
+        if payload:
+            for key, value in payload.get('model_aux', {}).items():
+                setattr(self, key, value.to(self._xyz.device))
+        self.assert_dsm_alignment()
+        return xyz_gradient_accum, denom, opt_dict
+
+    def _append_dsm_clone(self, selected_pts_mask):
+        if self.dsm_confidence.numel() == 0:
+            return
+        new_conf = self.dsm_confidence[selected_pts_mask] * self.dsm_clone_conf_scale
+        new_aid = self.dsm_anchor_id[selected_pts_mask]
+        self.dsm_confidence = torch.cat([self.dsm_confidence, new_conf], dim=0)
+        self.dsm_anchor_id = torch.cat([self.dsm_anchor_id, new_aid], dim=0)
+
+    def _append_dsm_split(self, selected_pts_mask, N):
+        if self.dsm_confidence.numel() == 0:
+            return
+        parent_conf = self.dsm_confidence[selected_pts_mask]
+        parent_aid = self.dsm_anchor_id[selected_pts_mask]
+        chunks = []
+        for i in range(N):
+            chunks.append(parent_conf if i == 0 else parent_conf * self.dsm_clone_conf_scale)
+        self.dsm_confidence = torch.cat([self.dsm_confidence, *chunks], dim=0)
+        self.dsm_anchor_id = torch.cat([self.dsm_anchor_id, parent_aid.repeat(N)], dim=0)
+
+    def save_dsm_state(self, path):
+        if self.dsm_confidence.numel() == 0:
+            return
+        mkdir_p(os.path.dirname(path))
+        np.savez_compressed(
+            path,
+            confidence=self.dsm_confidence.detach().cpu().numpy(),
+            anchor_id=self.dsm_anchor_id.detach().cpu().numpy(),
+            clone_conf_scale=np.array(self.dsm_clone_conf_scale),
+        )
+
+    def load_dsm_state(self, path):
+        data = np.load(path)
+        device = self._xyz.device if self._xyz.numel() else "cuda"
+        self.dsm_confidence = torch.tensor(data["confidence"], device=device, dtype=torch.float32)
+        self.dsm_anchor_id = torch.tensor(data["anchor_id"], device=device, dtype=torch.long)
+        self.dsm_clone_conf_scale = float(data['clone_conf_scale']) if 'clone_conf_scale' in data else 0.5
+        self.assert_dsm_alignment()
+
+    def assert_dsm_alignment(self):
+        n = len(self._xyz)
+        if len(self.dsm_confidence) != n or len(self.dsm_anchor_id) != n:
+            raise RuntimeError('DSM prior tensors are not aligned with Gaussian rows')
