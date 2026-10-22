@@ -27,7 +27,12 @@ conda create -y -n skyfall-gs python=3.10
 conda activate skyfall-gs
 conda install -y -c nvidia cuda-toolkit=12.8 cuda-nvcc=12.8
 
+# 先检查所选 Toolkit 内确实存在 nvcc，再设置 CUDA_HOME。
 export CUDA_HOME="$CONDA_PREFIX"
+# 如果 Conda 中没有 nvcc，但服务器已安装 CUDA 12.8，可改用：
+# export CUDA_HOME=/usr/local/cuda-12.8
+test -x "$CUDA_HOME/bin/nvcc" || { echo "CUDA_HOME 下没有 nvcc，请先安装 Toolkit 或修正路径"; exit 1; }
+"$CUDA_HOME/bin/nvcc" --version
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -35,12 +40,26 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements.txt -r requirements-dsm.txt
-python -m pip install matplotlib tqdm tensorboardX
+python -m pip install matplotlib tqdm tensorboardX ninja
+
+# 补齐来源子模块缺失的标准头文件；可重复执行。
+# 修复 std::uintptr_t / uint32_t / uint64_t 未定义的编译错误。
+python - <<'PYHEAD'
+from pathlib import Path
+p = Path("submodules/diff-gaussian-rasterization-depth/cuda_rasterizer/rasterizer_impl.h")
+s = p.read_text()
+headers = ("#include <cstdint>", "#include <stdint.h>", "#include <cstddef>")
+missing = [h for h in headers if h not in s]
+if missing:
+    assert "#pragma once" in s, "Unexpected rasterizer_impl.h layout"
+    p.write_text(s.replace("#pragma once", "#pragma once\n\n" + "\n".join(missing), 1))
+print("Rasterizer headers OK")
+PYHEAD
 
 # 必须在安装 PyTorch 后编译；更换 PyTorch/CUDA 后需重新编译。
-python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterization-depth
-python -m pip install --no-build-isolation ./submodules/simple-knn
-python -m pip install --no-build-isolation ./submodules/fused-ssim
+MAX_JOBS=2 python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterization-depth
+MAX_JOBS=2 python -m pip install --no-build-isolation ./submodules/simple-knn
+MAX_JOBS=2 python -m pip install --no-build-isolation ./submodules/fused-ssim
 ```
 
 CUDA Toolkit 的 `nvcc` 用于编译，PyTorch wheel 带运行时，两者都需要核对。安装依赖后再次确认 PyTorch 版本；若被其他包替换，重新安装上述版本并重编译扩展。
@@ -56,7 +75,7 @@ conda activate skyfall-gs
 export GPU=0
 nvcc --version
 python -c 'import torch; print(torch.__version__, torch.version.cuda); print("CUDA:", torch.cuda.is_available())'
-python -c 'import diff_gaussian_rasterization, simple_knn._C, fused_ssim; print("CUDA extensions OK")'
+python -c 'import diff_gauss, diff_gauss._C, simple_knn._C; from fused_ssim import fused_ssim; print("CUDA extensions OK")'
 
 CUDA_VISIBLE_DEVICES="$GPU" python -m pytest -q \
   tests/test_stage1_coordinates.py tests/test_dsm_migration.py
@@ -202,6 +221,34 @@ CUDA_VISIBLE_DEVICES="$GPU" python scripts/evaluate_stage1.py \
 每组文件位于对应模型目录，最后两个汇总位于 `RUN_ROOT`。几何评估采用过滤 opacity 后的高斯中心最大高程栅格，应同时看 MAE、RMSE 和覆盖率。同一 DSM 用于先验和评估时标为 `controlled_same_dsm`；空间 holdout 不等于独立真值，冒烟也不代替多种子、点数匹配的质量实验。
 
 ## 10. 常见问题
+
+### 找不到 nvcc
+
+`nvcc not found at .../envs/skyfall-gs/bin/nvcc` 表示 `CUDA_HOME` 指向的目录没有编译器。PyTorch 能使用 CUDA 不代表已安装 nvcc。不要仅根据环境名设置该路径，先执行：
+
+```bash
+ls -l "$CONDA_PREFIX/bin/nvcc" /usr/local/cuda-12.8/bin/nvcc
+```
+
+选择确实存在的 CUDA 12.8 Toolkit，例如：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+"$CUDA_HOME/bin/nvcc" --version
+python -c 'import torch; print(torch.__version__, torch.version.cuda)'
+```
+
+若两处都没有，先执行第 1 节的 Conda Toolkit 安装，再检查 `$CONDA_PREFIX/bin/nvcc`。不要把不含编译器的 PyTorch 运行时目录用作 CUDA_HOME。
+
+### 光栅化扩展的整数类型未定义
+
+若 `rasterizer_impl.h` 报 `namespace std has no member uintptr_t` 或 `uint32_t` / `uint64_t is undefined`，执行第 1 节的头文件修复代码，再重新编译光栅化扩展。这是来源头文件缺少显式 include，与 DSM 训练参数无关。该步骤会使子模块显示本地修改；重新检出或重置子模块后可能需要再次执行。
+
+### 缺少 ninja 与其他问题
+
+`could not find ninja` 本身只是回退到慢速编译的警告；执行 `python -m pip install ninja` 可解决。日志中的普通 CUDA/GLM warning 也不等于构建失败，应定位实际的 `error:`。
 
 - **CUDA 不可用**：确认激活了正确环境、`CUDA_VISIBLE_DEVICES` 是可用卡号，并检查驱动和 PyTorch CUDA 构建。
 - **扩展编译失败或 undefined symbol**：确认子模块完整、`CUDA_HOME` 指向所选 Toolkit；在最终 PyTorch 版本下重新安装三个扩展。内存不足时设置 `MAX_JOBS=2` 再编译。

@@ -45,6 +45,8 @@
 
 ## Installation
 
+For the `stage1-dsm` branch, use the complete [installation and run guide](README_STAGE1_DSM.md#1-安装环境), including CUDA compiler checks, the rasterizer header fix, and extension import verification. The upstream setup below is retained for reference.
+
 1.  **Clone the repository:**
 
     ```bash
