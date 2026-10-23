@@ -39,7 +39,9 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -r requirements.txt -r requirements-dsm.txt
+# 两份都必须安装；若任一步报错，先修复，不要直接继续编译和测试。
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dsm.txt
 python -m pip install matplotlib tqdm tensorboardX ninja
 
 # 补齐来源子模块缺失的标准头文件；可重复执行。
@@ -62,20 +64,25 @@ MAX_JOBS=2 python -m pip install --no-build-isolation ./submodules/simple-knn
 MAX_JOBS=2 python -m pip install --no-build-isolation ./submodules/fused-ssim
 ```
 
+`requirements.txt` 包含基础训练依赖（如 `plyfile`、`torchmetrics`、`OpenEXR`）；`requirements-dsm.txt` 只补充 DSM 与测试依赖（如 `scipy`、`tifffile`、`pytest`），不能替代前者。三个 CUDA 扩展安装成功也不代表 Python 训练依赖已齐全。所有安装均用 `python -m pip`，确保装入当前训练解释器。
+
 CUDA Toolkit 的 `nvcc` 用于编译，PyTorch wheel 带运行时，两者都需要核对。安装依赖后再次确认 PyTorch 版本；若被其他包替换，重新安装上述版本并重编译扩展。
 
 冒烟使用 `lambda_pseudo_depth=0`，不会实例化 MoGe；Stage 1 的该设置不需要 FlowEdit 推理。完整训练配置默认保留 MoGe，首次使用需要能够获取对应模型权重。子模块仍需完整拉取。
 
 ## 2. 先验证安装
 
-以下命令均从仓库根目录执行，每个新终端先激活环境。
+以下命令均从仓库根目录执行，每个新终端先激活环境并恢复第 1 节的 CUDA 路径配置。按“编译器 → CUDA 扩展 → 训练入口 → 单元测试 → 合成冒烟”的顺序检查，前一步失败时先修复再继续。
 
 ```bash
 conda activate skyfall-gs
 export GPU=0
+which python
+python -m pip --version
 nvcc --version
 python -c 'import torch; print(torch.__version__, torch.version.cuda); print("CUDA:", torch.cuda.is_available())'
 python -c 'import diff_gauss, diff_gauss._C, simple_knn._C; from fused_ssim import fused_ssim; print("CUDA extensions OK")'
+python -c 'import train; print("train import OK")'
 
 CUDA_VISIBLE_DEVICES="$GPU" python -m pytest -q \
   tests/test_stage1_coordinates.py tests/test_dsm_migration.py
@@ -84,9 +91,22 @@ python scripts/smoke_stage1_synthetic.py \
   --output "$PWD/outputs/dsm_synthetic_smoke" --gpu "$GPU"
 ```
 
-合成冒烟会训练 C 组 4 步、第 2 步保存恢复，并与连续训练比较，最后渲染评估。查看 `outputs/dsm_synthetic_smoke/synthetic_smoke_report.json` 中的 `accepted`。输出目录请为每次运行单独命名。
+合成冒烟会训练 C 组 4 步、第 2 步保存恢复，并与连续训练比较，最后渲染评估。输出目录请为每次运行单独命名，例如失败修复后改为 `outputs/dsm_synthetic_smoke_retry1`。
 
-两个来源数值对照测试需要设置 `DSM_REFERENCE_ROOT` 为原始来源 Skyfall-GS 目录；没有该目录时跳过，不影响独立运行。没有 CUDA 时部分 GPU 测试也会跳过，应结合合成冒烟判断环境是否可用。本地此前通过 27 项测试及合成冒烟；这不代表真实 JAX_068 的坐标和质量已验证。
+```bash
+cat outputs/dsm_synthetic_smoke/synthetic_smoke_report.json
+```
+
+本轮用户服务器实际验证结果为 **25 passed, 2 skipped**，合成报告 **`accepted: true`**。在有 CUDA、未配置来源参考代码的同版本环境中，这是预期结果。报告应确认：
+
+- `finite_loss_steps` 和 `finite_gradient_steps` 均为 4。
+- `prior_alignment`、`resumed` 均为 `true`，`surface_active_points` 大于 0。
+- 实际发生 clone 和 opacity reset；本轮为 `cloned: 48`、`opacity_resets: 1`。
+- 恢复与连续训练差异在脚本容差内；本轮最大参数差异约 `1.49e-8`，其他设备不必逐值一致。
+
+本轮 `split_added: 0`、`pruned: 0`：这份四步合成冒烟没有实际触发 split 和裁剪，二者由单独 GPU 单元测试覆盖。真实 200 步 A/B/C runner 的验收另要求实际加点和裁剪，不能用此报告替代。
+
+两个来源数值对照测试需要设置 `DSM_REFERENCE_ROOT` 为原始来源 Skyfall-GS 目录；没有该目录时跳过，不影响独立运行。没有 CUDA 时部分 GPU 测试也会跳过，应结合合成冒烟判断环境是否可用。本地带来源参考代码此前通过 27 项测试；用户服务器不带参考代码通过 25 项、跳过 2 项。这些结果不代表真实 JAX_068 的坐标和质量已验证。
 
 ## 3. 准备真实数据与路径
 
@@ -245,6 +265,45 @@ python -c 'import torch; print(torch.__version__, torch.version.cuda)'
 ### 光栅化扩展的整数类型未定义
 
 若 `rasterizer_impl.h` 报 `namespace std has no member uintptr_t` 或 `uint32_t` / `uint64_t is undefined`，执行第 1 节的头文件修复代码，再重新编译光栅化扩展。这是来源头文件缺少显式 include，与 DSM 训练参数无关。该步骤会使子模块显示本地修改；重新检出或重置子模块后可能需要再次执行。
+
+### 缺少 pytest、plyfile、torchmetrics 或 OpenEXR
+
+本轮遇到的 `ModuleNotFoundError` 均为 Python 依赖未安装完整，不需要为这些错误重编译 CUDA 扩展。先确认解释器，再补齐对应依赖：
+
+| 错误 | 安装命令 |
+| --- | --- |
+| `No module named pytest` | `python -m pip install -r requirements-dsm.txt` |
+| `No module named plyfile` | `python -m pip install plyfile` |
+| `No module named torchmetrics` | `python -m pip install torchmetrics` |
+| `No module named OpenEXR` | `python -m pip install OpenEXR` |
+
+推荐从整体上补齐基础和补充依赖，再验证训练入口：
+
+```bash
+conda activate skyfall-gs
+which python
+python -m pip --version
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dsm.txt
+python -m pip install matplotlib tqdm tensorboardX ninja
+python -c 'import train; print("train import OK")'
+```
+
+若依赖安装中途失败，应先解决该安装错误；只运行后面的命令不能证明前面的依赖已安装。扩展导入成功后仍可能缺少训练入口需要的模块，所以测试前保留 `import train` 检查。
+
+### 冒烟只显示 CalledProcessError
+
+`subprocess.CalledProcessError` 只表示训练子进程失败，具体异常写在输出目录的日志中。阶段 0 为首次训练，阶段 1 为恢复训练，阶段 2 为连续训练；检查终端最后一条失败命令对应的阶段。
+
+```bash
+# 改为本次实际使用的输出目录。
+export SMOKE_OUT="$PWD/outputs/dsm_synthetic_smoke"
+ls -lh "$SMOKE_OUT"/phase_*.log
+tail -n 100 "$SMOKE_OUT/phase_0.log"
+# 恢复或连续训练失败时，分别读取 phase_1.log 或 phase_2.log。
+```
+
+修复后使用新输出目录重新运行。若训练三个阶段都完成但后续比较或评估失败，保留终端完整 traceback 及 `synthetic_smoke_report.json`；不要只提供 `CalledProcessError` 最后一行。
 
 ### 缺少 ninja 与其他问题
 
