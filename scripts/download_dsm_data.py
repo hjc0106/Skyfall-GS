@@ -67,7 +67,7 @@ def fetch(url, path):
     # Some server networks work with curl HTTP/1.1 but interrupt Python TLS.
     if shutil.which('curl'):
         result = subprocess.run(['curl', '--http1.1', '--fail', '--location',
-                                 '--retry', '2', '--connect-timeout', '15', '--max-time', '180',
+                                 '--retry', '2', '--connect-timeout', '15', '--max-time', '3600',
                                  '--output', str(temporary), url])
         if result.returncode == 0:
             temporary.replace(path)

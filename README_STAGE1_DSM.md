@@ -146,7 +146,7 @@ python scripts/download_dsm_data.py --scene JAX_068 --source satnerf \
 
 `--source satnerf` 是新默认值。下载 ZIP 后只将指定场景的 DSM TIFF/TXT 写入输出目录，ZIP 保存在 `downloads/dfc2019/satnerf_EarthVision2022_dataset.zip`，供其他场景复用。会记录作者下载源和提取文件 SHA256，仍需完成坐标检查。
 
-发布页与附件链接已核实；当前工具环境访问 `release-assets.githubusercontent.com` 出现 TLS 中断，尚未完成整个公开 ZIP 的下载和内容比对。该来源是可尝试的独立 HTTPS 获取路径，不能据此保证所有服务器都可达。若服务器连接失败，可在能访问 GitHub 附件的电脑下载同一公开包，再用以下命令导入；这是获取公开发布包，不要求事先持有 DSM：
+已从公开 HTTPS 地址完整下载验证（671,413,648 字节），提取的 JAX_068 DSM TIFF/TXT 与本地参考逐字节一致，尺寸 512×512、分辨率 0.5 m。包内也包含 `root_dir/crops_rpcs_raw/JAX_068/scene.loc`。首次 curl 连接曾发生 TLS 中断，随后 Python HTTPS 下载成功；这不保证所有服务器都可达。若服务器连接失败，可在能访问 GitHub 附件的电脑下载同一公开包，再用以下命令导入；这是获取公开发布包，不要求事先持有 DSM：
 
 ```bash
 python scripts/download_dsm_data.py --scene JAX_068 \
@@ -197,7 +197,15 @@ python scripts/download_dsm_data.py --scene JAX_068 \
 #   --url "$DFC_TRUTH_URL" --output ./data/DFC2019/Track3-Truth
 ```
 
-`--url` 不会代替浏览器登录；需要会话凭据的链接请先用浏览器下载，再使用 `--archive`。脚本不生成 `scene.loc` 或匹配二维观测，DSM 下载完成仍需准备这些输入。
+`--url` 不会代替浏览器登录；需要会话凭据的链接请先用浏览器下载，再使用 `--archive`。脚本不生成或自动提取 `scene.loc`，也不提供当前 SfM 点匹配二维观测。SatNeRF ZIP 中的 raw `scene.loc` 可按下一段提取，但仍需核对坐标并准备匹配观测。
+
+```bash
+# 从默认下载缓存提取作者发布的 raw 场景原点，不覆盖已有文件。
+mkdir -p ./data/satnerf
+unzip -n ./downloads/dfc2019/satnerf_EarthVision2022_dataset.zip \
+  root_dir/crops_rpcs_raw/JAX_068/scene.loc -d ./data/satnerf
+export SCENE_LOC="$PWD/data/satnerf/root_dir/crops_rpcs_raw/JAX_068/scene.loc"
+```
 
 **已有本地数据迁移到另一台服务器**：本会话已检查的本地目录包含四个 JAX 场景的 DSM、影像及 RPC 预处理结果，可从新服务器执行以下命令复制（替换 `SOURCE_HOST`，需 SSH 访问源服务器）：
 
