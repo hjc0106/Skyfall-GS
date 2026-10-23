@@ -136,16 +136,39 @@ python scripts/download_stage1_data.py --scene JAX_068 --output ./data
 export DATASET="$PWD/data/datasets_JAX/JAX_068"
 ```
 
-**DSM 下载**：进入官方页面选择 `Train-Track3-Truth`，按页面要求完成访问后下载并解压，找到 `JAX_068_DSM.tif` 和 `JAX_068_DSM.txt`。官方仓库也提供 torrent 入口。这里不写未经验证的压缩包直链，也不假定 DataPort 登录链接是永久下载地址。若浏览器提供了可访问的实际文件 URL，可在服务器使用以下命令：
+**DSM 自动下载（官方 torrent）**：脚本读取 [官方 Track 3 种子](https://github.com/pubgeo/dfc2019/blob/master/data/DFC2019_track3_trainval_v1.0.0.torrent)，仅选择 `Train-Track3-Truth.zip`（已查询约 37.5 MiB），下载完成后只提取指定场景的 DSM TIFF/TXT，不下载整套 RGB/MSI。BitTorrent 按块下载，边界可能涉及相邻文件的少量数据。
 
 ```bash
-mkdir -p downloads
-# 将 URL 替换成页面提供的实际 ZIP 文件链接；需要登录时使用浏览器下载。
-# curl --fail --location --retry 3 --continue-at - \
-#   --output downloads/Train-Track3-Truth.zip "$DFC_TRUTH_URL"
-# unzip -l downloads/Train-Track3-Truth.zip
-# unzip downloads/Train-Track3-Truth.zip -d /data/DFC2019
+conda install -y -c conda-forge aria2
+python -m pip install -r requirements-dsm.txt
+
+# 查询真实文件清单，不下载 ZIP 数据。
+python scripts/download_dsm_data.py --scene JAX_068 --list-only
+
+# 下载 truth ZIP，提取并校验 JAX_068 的 DSM 与 sidecar。
+python scripts/download_dsm_data.py --scene JAX_068 \
+  --output ./data/DFC2019/Track3-Truth
+
+export DSM_TIF="$PWD/data/DFC2019/Track3-Truth/JAX_068_DSM.tif"
+export DSM_TXT="$PWD/data/DFC2019/Track3-Truth/JAX_068_DSM.txt"
 ```
+
+脚本校验 TIFF 尺寸与 sidecar，写出 `JAX_068_download.json` 记录文件 SHA256，并拒绝覆盖内容不同的已有文件。缓存位于 `downloads/dfc2019`，aria2 支持中断后重新执行继续下载。这里实际验证了官方种子文件清单和本地 ZIP 提取；没有宣称已验证新服务器上的完整 torrent 传输。
+
+若服务器禁止 BitTorrent 或无可用 peers，下载可能停滞。此时可从 [IEEE DataPort](https://ieee-dataport.org/open-access/data-fusion-contest-2019-dfc2019) 获取 `Train-Track3-Truth` ZIP，或使用另一台服务器已下载的包，再调用同一个脚本：
+
+```bash
+# 已有 ZIP：无需 aria2，也无需网络。
+python scripts/download_dsm_data.py --scene JAX_068 \
+  --archive /data/downloads/Train-Track3-Truth.zip \
+  --output ./data/DFC2019/Track3-Truth
+
+# 也支持 DataPort 页面给出的实际可访问 ZIP 文件 URL。
+# python scripts/download_dsm_data.py --scene JAX_068 \
+#   --url "$DFC_TRUTH_URL" --output ./data/DFC2019/Track3-Truth
+```
+
+`--url` 不会代替浏览器登录；需要会话凭据的链接请先用浏览器下载，再使用 `--archive`。脚本不生成 `scene.loc` 或匹配二维观测，DSM 下载完成仍需准备这些输入。
 
 **已有本地数据迁移到另一台服务器**：本会话已检查的本地目录包含四个 JAX 场景的 DSM、影像及 RPC 预处理结果，可从新服务器执行以下命令复制（替换 `SOURCE_HOST`，需 SSH 访问源服务器）：
 
