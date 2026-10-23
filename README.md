@@ -81,6 +81,8 @@ The datasets required to train the Skyfall-GS model should be placed in the `dat
 
 ### Downloading the Datasets
 
+For per-scene downloads, use `python scripts/download_stage1_data.py --scene JAX_068 --output ./data`. See the [DSM download links, commands and additional required inputs](README_STAGE1_DSM.md#3-准备真实数据与路径).
+
 The JAX and NYC datasets are available for download from Hugging Face or Google Drive.
 
 1.  **Download the zip files:**

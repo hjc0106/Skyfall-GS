@@ -110,6 +110,55 @@ cat outputs/dsm_synthetic_smoke/synthetic_smoke_report.json
 
 ## 3. 准备真实数据与路径
 
+### 下载链接与脚本
+
+| 数据 | 下载入口 | 说明 |
+| --- | --- | --- |
+| Skyfall-GS 转换后训练数据 | [Hugging Face](https://huggingface.co/datasets/jayinnn/Skyfall-GS-datasets/tree/main)；[Google Drive 备用](https://drive.google.com/drive/folders/1Uugwpf7n5fj7k4UJRBuKUyrmkYcDRScQ?usp=drive_link) | JAX/NYC 场景影像、训练相机和 SfM 输入；先使用这份数据运行 Stage 1 |
+| DFC2019 原始 RGB、DSM 和标签 | [IEEE DataPort](https://ieee-dataport.org/open-access/data-fusion-contest-2019-dfc2019)；[官方数据说明与 torrent 文件](https://github.com/pubgeo/dfc2019/tree/master/data) | DSM 在 `Train-Track3-Truth`；原始影像在 `Train-Track3-RGB-*`；RPC 相关元数据见 `Track3-Metadata` |
+| Skyfall-GS 视频评估数据 | [Hugging Face](https://huggingface.co/datasets/jayinnn/Skyfall-GS-eval) | 原项目视频评估使用，不是本分支 DSM 几何评估的必需输入 |
+
+**按场景下载（推荐）**：脚本只下载所选场景，打印实际解析的上游 commit；重复执行可复用下载缓存。它不生成 DSM、`scene.loc` 或二维观测。
+
+```bash
+conda activate skyfall-gs
+python -m pip install huggingface-hub==0.33.4
+
+# 先查看远端文件清单，不下载影像。
+python scripts/download_stage1_data.py --scene JAX_068 --output ./data --dry-run
+
+# 下载到 ./data/datasets_JAX/JAX_068。
+python scripts/download_stage1_data.py --scene JAX_068 --output ./data
+
+# 其他场景或其他磁盘：
+# python scripts/download_stage1_data.py --scene NYC_004 --output /data/skyfall
+# 固定上游版本复现时，增加 --revision <上次打印的commit>
+export DATASET="$PWD/data/datasets_JAX/JAX_068"
+```
+
+**DSM 下载**：进入官方页面选择 `Train-Track3-Truth`，按页面要求完成访问后下载并解压，找到 `JAX_068_DSM.tif` 和 `JAX_068_DSM.txt`。官方仓库也提供 torrent 入口。这里不写未经验证的压缩包直链，也不假定 DataPort 登录链接是永久下载地址。若浏览器提供了可访问的实际文件 URL，可在服务器使用以下命令：
+
+```bash
+mkdir -p downloads
+# 将 URL 替换成页面提供的实际 ZIP 文件链接；需要登录时使用浏览器下载。
+# curl --fail --location --retry 3 --continue-at - \
+#   --output downloads/Train-Track3-Truth.zip "$DFC_TRUTH_URL"
+# unzip -l downloads/Train-Track3-Truth.zip
+# unzip downloads/Train-Track3-Truth.zip -d /data/DFC2019
+```
+
+**已有本地数据迁移到另一台服务器**：本会话已检查的本地目录包含四个 JAX 场景的 DSM、影像及 RPC 预处理结果，可从新服务器执行以下命令复制（替换 `SOURCE_HOST`，需 SSH 访问源服务器）：
+
+```bash
+mkdir -p /data/skyfall-gs_exp/data
+rsync -avh --progress \
+  hongjiacheng@SOURCE_HOST:/home/hongjiacheng/codes/ArtiFixer/skyfall-gs_exp/data/ \
+  /data/skyfall-gs_exp/data/
+```
+
+该复制保留本地 `DFC2019/` 和 `root_dir/` 结构。`root_dir/crops_rpcs_raw`、`crops_rpcs_ba_v2` 是预处理产物，不能保证从 DFC2019 原始下载包直接获得。`scene.loc` 必须与所用坐标原点匹配；BA 版本与 raw 版本不可随意替换。当前未确认有公开下载包提供与现有 69,027 个 SfM 点逐轨迹匹配的二维观测，下载完成仍需执行第 5 节验证。
+
+
 ```text
 JAX_068/
 ├── images/

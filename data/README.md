@@ -4,6 +4,8 @@ This directory is the default location for the datasets required to train the Sk
 
 ## Downloading the Datasets
 
+Recommended: `python scripts/download_stage1_data.py --scene JAX_068 --output ./data` from the repository root (requires `huggingface-hub`). See the [full download guide](../README_STAGE1_DSM.md#3-准备真实数据与路径) for Hugging Face, DFC2019 DSM links and coordinate inputs.
+
 The JAX and NYC datasets are available for download from Google Drive.
 
 1.  **Download the zip files:**
