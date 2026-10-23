@@ -40,4 +40,4 @@ data/
     ├── NYC_219
     └── NYC_336
 ```
-DSM download: `python scripts/download_dsm_data.py --scene JAX_068 --output ./data/DFC2019/Track3-Truth` (requires aria2 and DSM Python dependencies; see the full guide for ZIP import fallback).
+DSM download: `python scripts/download_dsm_data.py --scene JAX_068 --output ./data/DFC2019/Track3-Truth` (defaults to the SatNeRF author HTTPS release; requires DSM Python dependencies; --source torrent additionally needs aria2; see the full guide for ZIP import fallback).

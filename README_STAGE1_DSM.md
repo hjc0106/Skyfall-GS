@@ -136,6 +136,25 @@ python scripts/download_stage1_data.py --scene JAX_068 --output ./data
 export DATASET="$PWD/data/datasets_JAX/JAX_068"
 ```
 
+**从零获取 DSM（默认 HTTPS 来源）**：使用 [SatNeRF 作者 EarthVision2022 发布包](https://github.com/centreborelli/satnerf/releases/tag/EarthVision2022)中的 `dataset.zip`，约 640 MB。作者 README 引用了其中的 `DFC2019/Track3-Truth`，此入口不依赖本机已有 DSM、BitTorrent tracker 或 peers。
+
+```bash
+python -m pip install -r requirements-dsm.txt
+python scripts/download_dsm_data.py --scene JAX_068 --source satnerf \
+  --output ./data/DFC2019/Track3-Truth
+```
+
+`--source satnerf` 是新默认值。下载 ZIP 后只将指定场景的 DSM TIFF/TXT 写入输出目录，ZIP 保存在 `downloads/dfc2019/satnerf_EarthVision2022_dataset.zip`，供其他场景复用。会记录作者下载源和提取文件 SHA256，仍需完成坐标检查。
+
+发布页与附件链接已核实；当前工具环境访问 `release-assets.githubusercontent.com` 出现 TLS 中断，尚未完成整个公开 ZIP 的下载和内容比对。该来源是可尝试的独立 HTTPS 获取路径，不能据此保证所有服务器都可达。若服务器连接失败，可在能访问 GitHub 附件的电脑下载同一公开包，再用以下命令导入；这是获取公开发布包，不要求事先持有 DSM：
+
+```bash
+python scripts/download_dsm_data.py --scene JAX_068 \
+  --archive /path/to/dataset.zip --output ./data/DFC2019/Track3-Truth
+```
+
+如果 GitHub 附件也不可达，另一独立来源是 IEEE DataPort 的 `Track 3 → Training data → Reference`，取得 `Train-Track3-Truth.zip` 后同样使用 `--archive`。目前未验证无需登录的稳定 DataPort 文件直链，不能把登录页面当作 ZIP 传给 `--url`。
+
 **DSM 自动下载（官方 torrent）**：脚本读取 [官方 Track 3 种子](https://github.com/pubgeo/dfc2019/blob/master/data/DFC2019_track3_trainval_v1.0.0.torrent)，仅选择 `Train-Track3-Truth.zip`（已查询约 37.5 MiB），下载完成后只提取指定场景的 DSM TIFF/TXT，不下载整套 RGB/MSI。BitTorrent 按块下载，边界可能涉及相邻文件的少量数据。
 
 ```bash
@@ -143,10 +162,10 @@ conda install -y -c conda-forge aria2
 python -m pip install -r requirements-dsm.txt
 
 # 查询真实文件清单，不下载 ZIP 数据。
-python scripts/download_dsm_data.py --scene JAX_068 --list-only
+python scripts/download_dsm_data.py --scene JAX_068 --source torrent --list-only
 
 # 下载 truth ZIP，提取并校验 JAX_068 的 DSM 与 sidecar。
-python scripts/download_dsm_data.py --scene JAX_068 \
+python scripts/download_dsm_data.py --scene JAX_068 --source torrent \
   --output ./data/DFC2019/Track3-Truth
 
 export DSM_TIF="$PWD/data/DFC2019/Track3-Truth/JAX_068_DSM.tif"

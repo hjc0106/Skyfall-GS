@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch DFC2019 Track 3 truth via its official torrent, or import a truth ZIP."""
+"""Fetch scene DSMs from a SatNeRF release, the DFC2019 torrent, or a local ZIP."""
 import argparse
 import hashlib
 import io
@@ -15,6 +15,9 @@ import zipfile
 
 TORRENT_URL = ('https://raw.githubusercontent.com/pubgeo/dfc2019/master/data/'
                'DFC2019_track3_trainval_v1.0.0.torrent')
+
+SATNERF_URL = ('https://github.com/centreborelli/satnerf/releases/download/'
+               'EarthVision2022/dataset.zip')
 
 
 def decode_torrent(data):
@@ -78,12 +81,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--scene', default='JAX_068')
     parser.add_argument('--output', type=Path, default=Path('data/DFC2019/Track3-Truth'))
+    parser.add_argument('--source', choices=['satnerf', 'torrent'], default='satnerf',
+                        help='Default: author-published SatNeRF HTTPS ZIP; torrent is optional')
     parser.add_argument('--cache', type=Path, default=Path('downloads/dfc2019'))
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--archive', type=Path, help='Import a previously downloaded truth ZIP')
     source.add_argument('--torrent-file', type=Path, help='Use local torrent metadata without fetching GitHub')
     source.add_argument('--url', help='Download a truth ZIP from an actual accessible file URL')
-    parser.add_argument('--list-only', action='store_true', help='List selected official torrent files without downloading payloads')
+    parser.add_argument('--list-only', action='store_true', help='List scene files (SatNeRF needs its cached/downloaded ZIP; torrent needs metadata only)')
     args = parser.parse_args()
     if not re.fullmatch(r'(JAX|OMA)_\d{3}', args.scene):
         parser.error('--scene must have the form JAX_068 or OMA_001')
@@ -95,6 +100,21 @@ def main():
         archive = args.cache / 'truth.zip'
         fetch(args.url, archive)
         files = [archive]
+    elif args.source == 'satnerf' and not args.torrent_file:
+        archive = args.cache / 'satnerf_EarthVision2022_dataset.zip'
+        if not archive.is_file():
+            print('Downloading author-published SatNeRF dataset (~640 MB): ' + SATNERF_URL, flush=True)
+            fetch(SATNERF_URL, archive)
+        else:
+            print('Using cached SatNeRF dataset: ' + str(archive))
+        if not zipfile.is_zipfile(archive):
+            parser.error('Cached SatNeRF ZIP is invalid; remove or replace ' + str(archive))
+        files = [archive]
+        if args.list_only:
+            with zipfile.ZipFile(archive) as z:
+                print('\n'.join(n for n in z.namelist() if Path(n).name in
+                                {args.scene + '_DSM.tif', args.scene + '_DSM.txt'}))
+            return
     else:
         torrent = args.torrent_file or args.cache / 'track3_trainval.torrent'
         if args.torrent_file and not torrent.is_file():
@@ -159,7 +179,7 @@ def main():
             parser.error('Refusing to overwrite a different file: ' + str(target))
     for name, data in found.items():
         (args.output / name).write_bytes(data)
-    report = {'scene': args.scene, 'source': 'local_archive' if args.archive else ('provided_url' if args.url else TORRENT_URL),
+    report = {'scene': args.scene, 'source': 'local_archive' if args.archive else ('provided_url' if args.url else (SATNERF_URL if args.source == 'satnerf' and not args.torrent_file else TORRENT_URL)),
               'shape': list(image.shape), 'sidecar': bounds,
               'sha256': {name: hashlib.sha256(data).hexdigest() for name, data in found.items()}}
     (args.output / (args.scene + '_download.json')).write_text(json.dumps(report, indent=2) + '\n')
