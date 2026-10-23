@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import time
 import urllib.request
 import zipfile
 
@@ -47,9 +49,29 @@ def decode_torrent(data):
 
 def fetch(url, path):
     temporary = path.with_suffix(path.suffix + '.part')
-    with urllib.request.urlopen(url, timeout=60) as response, temporary.open('wb') as out:
-        shutil.copyfileobj(response, out)
-    temporary.replace(path)
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(url, headers={'User-Agent': 'Skyfall-GS-data-downloader'})
+            with urllib.request.urlopen(request, timeout=30) as response, temporary.open('wb') as out:
+                shutil.copyfileobj(response, out)
+            temporary.replace(path)
+            return
+        except (OSError, ValueError):
+            temporary.unlink(missing_ok=True)
+            print(f'HTTPS download attempt {attempt + 1}/3 failed.', file=sys.stderr)
+            if attempt < 2:
+                time.sleep(attempt + 1)
+    # Some server networks work with curl HTTP/1.1 but interrupt Python TLS.
+    if shutil.which('curl'):
+        result = subprocess.run(['curl', '--http1.1', '--fail', '--location',
+                                 '--retry', '2', '--connect-timeout', '15', '--max-time', '180',
+                                 '--output', str(temporary), url])
+        if result.returncode == 0:
+            temporary.replace(path)
+            return
+        temporary.unlink(missing_ok=True)
+    raise RuntimeError('HTTPS download failed after retries. Check network/proxy, or use '
+                       '--torrent-file for existing metadata / --archive for an existing truth ZIP.')
 
 
 def main():
@@ -59,6 +81,7 @@ def main():
     parser.add_argument('--cache', type=Path, default=Path('downloads/dfc2019'))
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--archive', type=Path, help='Import a previously downloaded truth ZIP')
+    source.add_argument('--torrent-file', type=Path, help='Use local torrent metadata without fetching GitHub')
     source.add_argument('--url', help='Download a truth ZIP from an actual accessible file URL')
     parser.add_argument('--list-only', action='store_true', help='List selected official torrent files without downloading payloads')
     args = parser.parse_args()
@@ -73,9 +96,18 @@ def main():
         fetch(args.url, archive)
         files = [archive]
     else:
-        torrent = args.cache / 'track3_trainval.torrent'
-        fetch(TORRENT_URL, torrent)
-        info = decode_torrent(torrent.read_bytes())[b'info']
+        torrent = args.torrent_file or args.cache / 'track3_trainval.torrent'
+        if args.torrent_file and not torrent.is_file():
+            parser.error('Local torrent file does not exist: ' + str(torrent))
+        if not torrent.is_file():
+            fetch(TORRENT_URL, torrent)
+        else:
+            print('Using existing torrent metadata: ' + str(torrent))
+        try:
+            info = decode_torrent(torrent.read_bytes())[b'info']
+        except (ValueError, KeyError, TypeError):
+            parser.error('Invalid torrent metadata: ' + str(torrent) +
+                         '; replace it with a valid official torrent before retrying')
         root = Path(info[b'name'].decode())
         entries = info.get(b'files')
         if entries is None:
@@ -135,4 +167,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'Download failed: {error}', file=sys.stderr)
+        sys.exit(1)

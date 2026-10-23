@@ -155,6 +155,16 @@ export DSM_TXT="$PWD/data/DFC2019/Track3-Truth/JAX_068_DSM.txt"
 
 脚本校验 TIFF 尺寸与 sidecar，写出 `JAX_068_download.json` 记录文件 SHA256，并拒绝覆盖内容不同的已有文件。缓存位于 `downloads/dfc2019`，aria2 支持中断后重新执行继续下载。这里实际验证了官方种子文件清单和本地 ZIP 提取；没有宣称已验证新服务器上的完整 torrent 传输。
 
+重复运行会复用已存在的 `downloads/dfc2019/track3_trainval.torrent`，不再每次访问 GitHub。首次 HTTPS 失败会重试，并在已安装 curl 时尝试 HTTP/1.1，始终保留证书校验。也可以显式指定本地种子：
+
+```bash
+python scripts/download_dsm_data.py --scene JAX_068 \
+  --torrent-file ./downloads/dfc2019/track3_trainval.torrent \
+  --output ./data/DFC2019/Track3-Truth
+```
+
+`SSL: UNEXPECTED_EOF_WHILE_READING` 表示获取元数据时 TLS 连接中断；`tracker ... status=502`、`CN:0 SD:0` 则是后续 torrent 连接失败。缓存复用只能解决前者的重复联网，不能修复 tracker 或创建 peers。若官方种子已经缓存，继续反复删除缓存反而会增加网络依赖。
+
 若服务器禁止 BitTorrent 或无可用 peers，下载可能停滞。此时可从 [IEEE DataPort](https://ieee-dataport.org/open-access/data-fusion-contest-2019-dfc2019) 获取 `Train-Track3-Truth` ZIP，或使用另一台服务器已下载的包，再调用同一个脚本：
 
 ```bash
