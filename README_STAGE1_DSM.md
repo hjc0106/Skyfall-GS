@@ -426,3 +426,23 @@ tail -n 100 "$SMOKE_OUT/phase_0.log"
 - **GitHub push 提示无法读取 Username**：先在本机配置 GitHub HTTPS 凭据或 SSH 登录，再执行 `git push -u origin stage1-dsm`。
 
 更多实现细节见 [迁移说明](docs/stage1_dsm_usage.md) 和 [迁移计划](docs/stage1_dsm_migration_plan.md)。
+
+## 11. 自动搜索观测、验证并启动
+
+```bash
+# 从仓库根目录执行。默认搜索训练数据目录，也可增加原始 SfM 输出目录。
+python scripts/start_stage1_dsm.py \
+  --source ./data/datasets_JAX/JAX_068 \
+  --prior ./outputs/priors/JAX_068/dsm_prior.npz \
+  --output ./outputs/JAX_068_checked_smoke_s0 \
+  --search-root /path/to/original_sfm_outputs --gpu 0
+```
+
+将 `--search-root` 替换为真实存在的原始重建目录；可重复传入多个目录。没有额外目录时删去此参数。脚本寻找 `images.txt/bin`，使用原有严格验证器核对轨迹身份、重投影、DSM 支持和往返；只有通过后才运行 200 步 A/B/C。搜索不会把 RGB `images/` 目录当成观测文件，也不会改写数据或伪造报告。
+
+- 已知文件位置时使用 `--observations /path/to/images.bin`，只验证该文件。
+- 只验证不训练：加 `--validate-only`。
+- 完整训练：检查通过后用新输出目录并加 `--full`。
+- 缺文件或检查未通过：退出码 2，原因见 `startup_report.json`，候选检查详见 `coordinate_candidate_*.json` 与对应日志。
+
+**这个入口不能从缺失信息中生成原始二维观测。** 已检查 SatNeRF 作者公开 ZIP，没有 COLMAP `images.txt/bin` 或数据库；另一套 RPC 关键点不匹配当前 69,027 点。若只有目前公开下载的数据，脚本应停止。满足严格启动要求仍需向当前 SfM 数据的提供者取得原始 COLMAP 观测；若原始观测确实无法获得，需要另立方案重新构建相机/点云/观测一致的数据集并重新生成先验，不能仅把新 COLMAP 文件塞给现有点云。不能承诺当前公开包即可一键通过该门禁。
